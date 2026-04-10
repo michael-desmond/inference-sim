@@ -1,4 +1,4 @@
-module github.com/inference-sim/inference-sim
+module github.com/michael-desmond/inference-sim
 
 go 1.21
 
