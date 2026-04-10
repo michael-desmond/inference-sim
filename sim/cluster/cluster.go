@@ -41,6 +41,9 @@ type ClusterSimulator struct {
 	poolMembership       map[string]PoolRole    // instance ID → pool role (nil when disaggregation disabled)
 	disaggregationDecider sim.DisaggregationDecider // PD disaggregation decider (nil when disabled)
 
+	// Observer support
+	observers []sim.RegisteredObserver // registered observers with their intervals
+
 	// PD disaggregation state (PR2)
 	parentRequests            map[string]*ParentRequest // parent request ID → tracking record
 	pendingPrefillCompletions map[string]string         // prefill sub-req ID → parent ID
@@ -614,6 +617,9 @@ func (c *ClusterSimulator) Run() error {
 		if len(c.deferredQueue) > 0 && !c.isBusy() {
 			c.promoteDeferred()
 		}
+
+		// Notify observers if any are registered and their interval has elapsed
+		c.notifyObservers()
 	}
 
 	// 4. Finalize all instances (populates StillQueued/StillRunning)
@@ -1195,6 +1201,65 @@ func (c *ClusterSimulator) MeanTransferQueueDepth() float64 {
 		return 0
 	}
 	return float64(c.transferDepthSum) / float64(c.transferStartCount)
+}
+
+// RegisterObserver registers an observer to be called at the specified interval.
+// The observer will be called with a SimulationState snapshot containing all instance states.
+// interval is in microseconds (e.g., 1_000_000 = 1 second).
+// Must be called before Run().
+func (c *ClusterSimulator) RegisterObserver(observer sim.Observer, interval int64) {
+	if c.hasRun {
+		panic("RegisterObserver: cannot add observer after Run() has been called")
+	}
+	if interval <= 0 {
+		panic(fmt.Sprintf("RegisterObserver: interval must be > 0, got %d", interval))
+	}
+	c.observers = append(c.observers, sim.RegisteredObserver{
+		Observer:     observer,
+		Interval:     interval,
+		LastObserved: 0,
+	})
+}
+
+// notifyObservers checks if any observers need to be called at the current clock time
+// and invokes them with a snapshot of the current simulation state.
+func (c *ClusterSimulator) notifyObservers() {
+	if len(c.observers) == 0 {
+		return
+	}
+
+	for i := range c.observers {
+		reg := &c.observers[i]
+		if c.clock-reg.LastObserved >= reg.Interval {
+			// Build state snapshot
+			state := c.buildObservationState()
+			// Notify observer
+			reg.Observer.Observe(state)
+			// Update last observed time
+			reg.LastObserved = c.clock
+		}
+	}
+}
+
+// buildObservationState creates a SimulationState snapshot from current instance states.
+func (c *ClusterSimulator) buildObservationState() sim.SimulationState {
+	instances := make([]sim.InstanceState, 0, len(c.instances))
+	for _, inst := range c.instances {
+		m := inst.Metrics()
+		instances = append(instances, sim.InstanceState{
+			ID:                string(inst.ID()),
+			QueueDepth:        inst.QueueDepth(),
+			BatchSize:         inst.BatchSize(),
+			KVUtilization:     inst.KVUtilization(),
+			CompletedRequests: m.CompletedRequests,
+			TimedOutRequests:  m.TimedOutRequests,
+			DroppedRequests:   m.DroppedUnservable,
+		})
+	}
+	return sim.SimulationState{
+		Clock:     c.clock,
+		Instances: instances,
+	}
 }
 
 // mergeFloat64Map merges src into dst, logging a warning on duplicate keys.
