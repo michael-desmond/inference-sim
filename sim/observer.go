@@ -21,6 +21,8 @@ type InstanceState struct {
 	BatchSize int
 	// KVUtilization is the fraction of KV cache blocks in use (0.0 to 1.0)
 	KVUtilization float64
+	// CacheHitRate is the cache hit rate (0.0 to 1.0)
+	CacheHitRate float64
 	// CompletedRequests is the cumulative count of completed requests
 	CompletedRequests int
 	// TimedOutRequests is the cumulative count of timed out requests

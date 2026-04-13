@@ -1251,6 +1251,7 @@ func (c *ClusterSimulator) buildObservationState() sim.SimulationState {
 			QueueDepth:        inst.QueueDepth(),
 			BatchSize:         inst.BatchSize(),
 			KVUtilization:     inst.KVUtilization(),
+			CacheHitRate:      inst.CacheHitRate(),
 			CompletedRequests: m.CompletedRequests,
 			TimedOutRequests:  m.TimedOutRequests,
 			DroppedRequests:   m.DroppedUnservable,

@@ -129,3 +129,83 @@ func TestClusterSimulator_RegisterObserver_InvalidInterval(t *testing.T) {
 	observer := &TestObserver{}
 	cluster.RegisterObserver(observer, 0)
 }
+
+func TestClusterSimulator_Observer_InstanceStateFields(t *testing.T) {
+	// Create a cluster with 2 instances to test multiple instance states
+	cfg := newTestDeploymentConfig(2)
+	cfg.Horizon = 10_000_000 // 10 seconds
+
+	// Create observer
+	observer := &TestObserver{}
+
+	// Create requests to generate activity
+	requests := newTestRequests(100)
+	cluster := NewClusterSimulator(cfg, requests, nil)
+	cluster.RegisterObserver(observer, 1_000_000) // 1 second
+
+	// Run simulation
+	mustRun(t, cluster)
+
+	// Verify observer was called
+	if len(observer.observations) == 0 {
+		t.Fatal("Expected observer to be called at least once, but got 0 observations")
+	}
+
+	// Check that all expected fields are populated correctly in at least one observation
+	foundValidObservation := false
+	for i, obs := range observer.observations {
+		if len(obs.Instances) == 0 {
+			continue
+		}
+
+		for j, inst := range obs.Instances {
+			// ID should not be empty
+			if inst.ID == "" {
+				t.Errorf("Observation %d, Instance %d: ID is empty", i, j)
+			}
+
+			// QueueDepth should be non-negative
+			if inst.QueueDepth < 0 {
+				t.Errorf("Observation %d, Instance %d: QueueDepth = %d, expected >= 0", i, j, inst.QueueDepth)
+			}
+
+			// BatchSize should be non-negative
+			if inst.BatchSize < 0 {
+				t.Errorf("Observation %d, Instance %d: BatchSize = %d, expected >= 0", i, j, inst.BatchSize)
+			}
+
+			// KVUtilization should be between 0.0 and 1.0
+			if inst.KVUtilization < 0.0 || inst.KVUtilization > 1.0 {
+				t.Errorf("Observation %d, Instance %d: KVUtilization = %f, expected between 0.0 and 1.0", i, j, inst.KVUtilization)
+			}
+
+			// CacheHitRate should be between 0.0 and 1.0
+			if inst.CacheHitRate < 0.0 || inst.CacheHitRate > 1.0 {
+				t.Errorf("Observation %d, Instance %d: CacheHitRate = %f, expected between 0.0 and 1.0", i, j, inst.CacheHitRate)
+			}
+
+			// CompletedRequests should be non-negative
+			if inst.CompletedRequests < 0 {
+				t.Errorf("Observation %d, Instance %d: CompletedRequests = %d, expected >= 0", i, j, inst.CompletedRequests)
+			}
+
+			// TimedOutRequests should be non-negative
+			if inst.TimedOutRequests < 0 {
+				t.Errorf("Observation %d, Instance %d: TimedOutRequests = %d, expected >= 0", i, j, inst.TimedOutRequests)
+			}
+
+			// DroppedRequests should be non-negative
+			if inst.DroppedRequests < 0 {
+				t.Errorf("Observation %d, Instance %d: DroppedRequests = %d, expected >= 0", i, j, inst.DroppedRequests)
+			}
+
+			foundValidObservation = true
+		}
+	}
+
+	if !foundValidObservation {
+		t.Error("Expected to find at least one valid observation with instance data")
+	}
+
+	t.Logf("Observer captured %d observations, verified all InstanceState fields", len(observer.observations))
+}
