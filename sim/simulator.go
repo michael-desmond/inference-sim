@@ -200,9 +200,25 @@ func (sim *Simulator) PeekNextEventTime() int64 {
 // pending-request tracking) without maintaining fragile before/after heuristics.
 // Caller MUST check HasPendingEvents() first. Panics on empty queue.
 // Does NOT check horizon — caller is responsible.
+//
+// Special case — lazy cancellation: if the popped event is a TimeoutEvent for a
+// request that has already completed (State == StateCompleted), the event is
+// returned immediately without advancing Clock or calling Execute(). This models
+// real-world client behavior where a deadline timer is cancelled the moment a
+// response arrives, preventing orphaned timeouts from inflating SimEndedTime.
 func (sim *Simulator) ProcessNextEvent() Event {
 	entry := heap.Pop(&sim.eventQueue).(eventEntry)
 	ev := entry.event
+
+	// Lazy cancellation: a TimeoutEvent whose request already completed is an
+	// orphan — the real-world equivalent of a client cancelling its deadline
+	// timer when the response arrives. Skip it before advancing the clock so
+	// Finalize() captures SimEndedTime from the last real-work event, not from
+	// an orphaned no-op timeout 300s in the future.
+	if te, ok := ev.(*TimeoutEvent); ok && te.Request.State == StateCompleted {
+		return ev
+	}
+
 	sim.Clock = ev.Timestamp()
 	logrus.Debugf("[tick %07d] Executing %T", sim.Clock, ev)
 	ev.Execute(sim)
@@ -587,8 +603,22 @@ func (sim *Simulator) scheduleBatch(now int64) {
 // executeBatchStep handles Phase 2: model execution (prefill + decode) for all requests
 // in the running batch. Returns the step time advance in ticks.
 func (sim *Simulator) executeBatchStep(now int64) int64 {
-	// Estimate step time via LatencyModel (blackbox or roofline, selected at construction)
-	currStepAdvance := sim.latencyModel.StepTime(sim.RunningBatch.Requests)
+	// Match vLLM's scheduled_running_reqs: only requests that were allocated
+	// tokens by FormBatch participate in the forward pass latency computation.
+	// Requests with NumNewTokens=0 (past Phase 1 break point, token budget
+	// exhaustion, or MaxModelLen boundary) retain their KV blocks and remain
+	// in RunningBatch for the next step, but do not contribute to this step's
+	// compute time. See vllm/v1/core/sched/scheduler.py scheduled_running_reqs.
+	// Note: scheduled may be empty when all requests are idle (e.g., after
+	// Phase 1 preemption cascade). All StepTime backends handle empty batches
+	// correctly (return >= 1), and the max(1, ...) floor below guarantees INV-3.
+	scheduled := make([]*Request, 0, len(sim.RunningBatch.Requests))
+	for _, req := range sim.RunningBatch.Requests {
+		if req.NumNewTokens > 0 {
+			scheduled = append(scheduled, req)
+		}
+	}
+	currStepAdvance := sim.latencyModel.StepTime(scheduled)
 
 	// Add transfer latency from CPU→GPU reloads (0 for single-tier)
 	currStepAdvance += sim.KVCache.ConsumePendingTransferLatency()
@@ -672,8 +702,9 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 				}
 			}
 			// ReleaseKVBlocks is safe even when the final-token allocation failed:
-			// AllocateKVBlocks only modifies RequestMap on success, so Release
-			// frees exactly the blocks from prior successful allocations.
+			// the decode pre-check returns false before any state mutation (check-then-act
+			// pattern, matching vLLM kv_cache_manager.py:334-336), so RequestMap is
+			// preserved and Release frees all blocks from prior successful allocations.
 			sim.KVCache.ReleaseKVBlocks(req)
 			req.FinishedStepIdx = sim.stepCount
 			sim.Schedule(&RequestLeftEvent{

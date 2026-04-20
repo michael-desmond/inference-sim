@@ -3,12 +3,11 @@ package cluster
 import "github.com/inference-sim/inference-sim/sim"
 
 // DefaultCacheSignalDelay is the default propagation delay for prefix cache
-// signals in microseconds (2 seconds). Only affects precise-prefix-cache and
+// signals in microseconds (50ms). Only affects precise-prefix-cache and
 // no-hit-lru scorers; has no observable effect on other routing policies.
-// Matches production llm-d's defaultSpeculativeTTL — the blind spot between
-// a routing decision and KV event arrival via ZMQ.
+// Models aggregate signal staleness from production llm-d metrics polling.
 // Set to 0 for oracle mode (live cache state).
-const DefaultCacheSignalDelay int64 = 2_000_000
+const DefaultCacheSignalDelay int64 = 50_000
 
 // DeploymentConfig describes a cluster where all instances share identical
 // hardware and model configuration. NumInstances must be >= 1.
@@ -43,7 +42,7 @@ type DeploymentConfig struct {
 	// When > 0, those scorers query a periodically-refreshed stale snapshot of each
 	// instance's KV cache block hash map instead of live state.
 	// Models the asynchronous KV event propagation delay in production llm-d.
-	// Default: DefaultCacheSignalDelay (2s), matching llm-d's speculative TTL.
+	// Default: DefaultCacheSignalDelay (50ms). Feeds into ObservabilityConfig.CacheBlocks.
 	// 0 = oracle mode (scorers read live cache state with zero delay).
 	// Units: microseconds of simulated time.
 	CacheSignalDelay int64
@@ -81,10 +80,14 @@ type DeploymentConfig struct {
 
 	// Phase 1C: Model autoscaler pipeline (issue #692).
 	// Zero value is safe: ModelAutoscalerIntervalUs=0 disables the autoscaler entirely (INV-6).
-	ModelAutoscalerIntervalUs float64   `yaml:"model_autoscaler_interval_us,omitempty"` // tick interval in μs; 0 = autoscaler disabled
-	ActuationDelay            DelaySpec `yaml:"actuation_delay,omitempty"`              // HPA/KEDA scrape lag; zero = same-tick actuation; Mean/Stddev in seconds
-	ScaleUpCooldownUs         float64   `yaml:"scale_up_cooldown_us,omitempty"`          // min μs between scale-up decisions per model
-	ScaleDownCooldownUs       float64   `yaml:"scale_down_cooldown_us,omitempty"`        // min μs between scale-down decisions per model
+	ModelAutoscalerIntervalUs float64                    `yaml:"model_autoscaler_interval_us,omitempty"` // tick interval in μs; 0 = autoscaler disabled
+	ActuationDelay            DelaySpec                  `yaml:"actuation_delay,omitempty"`              // HPA/KEDA scrape lag; zero = same-tick actuation; Mean/Stddev in seconds
+	ScaleUpCooldownUs         float64                    `yaml:"scale_up_cooldown_us,omitempty"`          // min μs between scale-up decisions per model
+	ScaleDownCooldownUs       float64                    `yaml:"scale_down_cooldown_us,omitempty"`        // min μs between scale-down decisions per model
+	// AutoscalerAnalyzerConfig holds V2SaturationAnalyzer thresholds.
+	// Zero values are safe: NewClusterSimulator applies WVA reference defaults
+	// (KvCacheThreshold=0.8, ScaleUpThreshold=0.8, ScaleDownBoundary=0.4, AvgInputTokens=512).
+	AutoscalerAnalyzerConfig  V2SaturationAnalyzerConfig `yaml:"autoscaler_analyzer,omitempty"`
 
 	// Phase 1B-1a: tier-ordered admission shedding config (issue #809).
 	// TierShedMinPriority=0 rejects sheddable tiers (priority < 0) under overload.

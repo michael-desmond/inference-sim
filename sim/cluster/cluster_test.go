@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/inference-sim/inference-sim/sim"
 	"github.com/inference-sim/inference-sim/sim/internal/testutil"
@@ -2557,3 +2558,392 @@ func TestClusterSimulator_MultiTurnSession_EndToEnd(t *testing.T) {
 			followUpCount, expectedFollowUps, numSessions, maxRounds-1)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Autoscaler wiring tests
+// ---------------------------------------------------------------------------
+
+func TestNewClusterSimulator_AutoscalerWiredWhenEnabled(t *testing.T) {
+	cfg := newTestDeploymentConfig(2)
+	cfg.ModelAutoscalerIntervalUs = 30_000_000
+	// AutoscalerAnalyzerConfig zero values → defaults applied inside constructor.
+	cs := NewClusterSimulator(cfg, nil, nil)
+	if cs.autoscaler == nil {
+		t.Fatal("autoscaler must not be nil when ModelAutoscalerIntervalUs > 0")
+	}
+	if cs.autoscaler.collector == nil {
+		t.Error("autoscaler.collector must not be nil")
+	}
+	if cs.autoscaler.analyzer == nil {
+		t.Error("autoscaler.analyzer must not be nil")
+	}
+	if cs.autoscaler.engine == nil {
+		t.Error("autoscaler.engine must not be nil")
+	}
+	if cs.autoscaler.actuator == nil {
+		t.Error("autoscaler.actuator must not be nil")
+	}
+}
+
+func TestNewClusterSimulator_AutoscalerNilWhenDisabled(t *testing.T) {
+	cfg := newTestDeploymentConfig(2)
+	// ModelAutoscalerIntervalUs == 0 (default) → autoscaler stays nil.
+	cs := NewClusterSimulator(cfg, nil, nil)
+	if cs.autoscaler != nil {
+		t.Error("autoscaler must be nil when ModelAutoscalerIntervalUs == 0")
+	}
+}
+
+// TestAutoscaler_RequestBoundedRun_Terminates verifies that a request-bounded run
+// (Horizon == math.MaxInt64) with the autoscaler enabled terminates correctly.
+// Regression test for Bug 2: scheduleNextTick had no termination guard, causing
+// an infinite event loop on request-bounded runs.
+func TestAutoscaler_RequestBoundedRun_Terminates(t *testing.T) {
+	cfg := newTestDeploymentConfig(1)
+	cfg.ModelAutoscalerIntervalUs = 100_000 // 100 ms ticks — fires many times during test
+	reqs := newTestRequests(10)
+
+	cs := NewClusterSimulator(cfg, reqs, nil)
+
+	done := make(chan error, 1)
+	go func() { done <- cs.Run() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+		// INV-1: all requests must be accounted for — premature termination would
+		// silently lose requests while still passing the timeout check.
+		agg := cs.AggregatedMetrics()
+		if agg.CompletedRequests != len(reqs) {
+			t.Errorf("INV-1: expected %d completed, got %d (queued=%d, running=%d)",
+				len(reqs), agg.CompletedRequests, agg.StillQueued, agg.StillRunning)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not terminate within 2s — autoscaler tick loop is likely infinite (Bug 2 regression)")
+	}
+}
+
+// TestPushArrival_CoInvariant_SessionFollowUpsProcessed verifies the
+// pendingArrivals co-invariant end-to-end: session follow-up requests
+// injected via pushArrival (inside the OnRequestDone callback) are fully
+// processed by the cluster simulation.
+//
+// If pushArrival failed to increment pendingArrivals for follow-ups, the
+// autoscaler's scheduleNextTick termination guard (pendingArrivals <= 0)
+// would fire prematurely, causing Run() to return before follow-ups complete
+// and breaking INV-1 conservation.
+func TestPushArrival_CoInvariant_SessionFollowUpsProcessed(t *testing.T) {
+	cfg := newTestDeploymentConfig(1)
+	cfg.ModelAutoscalerIntervalUs = 100_000 // enable autoscaler to exercise termination guard
+
+	const initial = 3
+	reqs := newTestRequests(initial)
+
+	// Each initial request generates exactly one follow-up; follow-ups generate none.
+	followUpsIssued := 0
+	onDone := func(req *sim.Request, tick int64) []*sim.Request {
+		if followUpsIssued >= initial {
+			return nil
+		}
+		followUpsIssued++
+		return []*sim.Request{{
+			ID:           fmt.Sprintf("followup-%d", followUpsIssued),
+			ArrivalTime:  tick,
+			InputTokens:  make([]int, 50),
+			OutputTokens: make([]int, 20),
+			MaxOutputLen: 20,
+			State:        sim.StateQueued,
+		}}
+	}
+
+	cs := NewClusterSimulator(cfg, reqs, onDone)
+
+	done := make(chan error, 1)
+	go func() { done <- cs.Run() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() returned error: %v", err)
+		}
+		agg := cs.AggregatedMetrics()
+		want := initial * 2 // initial + one follow-up each
+		if agg.CompletedRequests != want {
+			t.Errorf("completed = %d, want %d — follow-up requests not tracked by pendingArrivals co-invariant",
+				agg.CompletedRequests, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() timed out — autoscaler terminated early, pendingArrivals co-invariant likely broken for follow-up requests")
+	}
+}
+
+// newBatchTestRequests creates n requests with the given SLOClass,
+// arriving every 10µs starting at t=0, with 50 input tokens and 20 output tokens.
+func newBatchTestRequests(n int, sloClass string) []*sim.Request {
+	reqs := make([]*sim.Request, n)
+	for i := range reqs {
+		reqs[i] = &sim.Request{
+			ID:           fmt.Sprintf("req_%s_%d", sloClass, i),
+			ArrivalTime:  int64(i) * 10,
+			SLOClass:     sloClass,
+			InputTokens:  make([]int, 50),
+			OutputTokens: make([]int, 20),
+			State:        sim.StateQueued,
+		}
+	}
+	return reqs
+}
+
+// TestBatchRequestsNotSerialized verifies that batch and background requests are
+// NOT serialized — they flow through admission like standard requests.
+// This is a regression guard for issue #965.
+func TestBatchRequestsNotSerialized(t *testing.T) {
+	for _, sloClass := range []string{"batch", "background"} {
+		t.Run(sloClass, func(t *testing.T) {
+			requests := newBatchTestRequests(10, sloClass)
+			cfg := newTestDeploymentConfig(1)
+			cs := NewClusterSimulator(cfg, requests, nil)
+			mustRun(t, cs)
+
+			// Always-admit must not reject batch/background requests.
+			if cs.RejectedRequests() != 0 {
+				t.Errorf("expected 0 rejections under always-admit, got %d", cs.RejectedRequests())
+			}
+
+			m := cs.AggregatedMetrics()
+			if m.CompletedRequests != 10 {
+				t.Fatalf("completed %d requests, want 10", m.CompletedRequests)
+			}
+
+			// Batch/background requests must flow through admission concurrently (not serialized).
+			// With beta=[1000,10,5]: concurrent mean ~6.6ms, serialized mean ~99ms.
+			// 15ms gives ~8ms margin above the concurrent ceiling.
+			ttftMeanMs := float64(m.TTFTSum) / float64(m.CompletedRequests) / 1000.0
+			const boundMs = 15.0
+			if ttftMeanMs >= boundMs {
+				t.Errorf("mean TTFT %.2fms >= bound %.1fms: %s requests are being serialized (regression: #965)", ttftMeanMs, boundMs, sloClass)
+			}
+		})
+	}
+}
+
+// TestClusterSimulator_OrphanedTimeout_DoesNotInflateSimEndedTime verifies that
+// the cluster path's prevClusterClock save/restore (cluster.go) prevents orphaned
+// TimeoutEvents from inflating AggregatedMetrics().SimEndedTime. This is the
+// cluster-mode companion to TestTimeout_OrphanedTimeout_DoesNotInflateSimEndedTime
+// in sim/timeout_test.go.
+//
+// Scenario: 5 requests complete quickly but each bears a 300s Deadline
+// (mimicking DefaultTimeoutUs). Without the c.clock restore in the cluster loop,
+// c.clock would advance to arrival+300s for the last request, inflating SimEndedTime.
+func TestClusterSimulator_OrphanedTimeout_DoesNotInflateSimEndedTime(t *testing.T) {
+	config := DeploymentConfig{
+		SimConfig: sim.SimConfig{
+			Horizon:             500_000_000, // 500s — beyond workload.DefaultTimeoutUs (300s)
+			Seed:                42,
+			KVCacheConfig:       sim.NewKVCacheConfig(10000, 16, 0, 0, 0, 0),
+			BatchConfig:         sim.NewBatchConfig(256, 2048, 0),
+			LatencyCoeffs:       sim.NewLatencyCoeffs([]float64{1000, 10, 5}, []float64{0, 0, 0}),
+			ModelHardwareConfig: sim.NewModelHardwareConfig(sim.ModelConfig{}, sim.HardwareCalib{}, "test", "H100", 1, "blackbox", 0),
+		},
+		NumInstances: 2,
+	}
+
+	rng := sim.NewPartitionedRNG(sim.NewSimulationKey(42))
+	workloadRNG := rng.ForSubsystem(sim.SubsystemWorkload)
+
+	requests := make([]*sim.Request, 5)
+	for i := 0; i < 5; i++ {
+		arrivalTime := int64(i * 100_000) // stagger arrivals by 100ms
+		requests[i] = &sim.Request{
+			ID:           fmt.Sprintf("r%d", i),
+			ArrivalTime:  arrivalTime,
+			InputTokens:  sim.GenerateRandomTokenIDs(workloadRNG, 10),
+			OutputTokens: sim.GenerateRandomTokenIDs(workloadRNG, 5),
+			State:        sim.StateQueued,
+			MaxOutputLen: 5,
+			Deadline:     arrivalTime + workload.DefaultTimeoutUs,
+		}
+	}
+
+	cs := NewClusterSimulator(config, requests, nil)
+	mustRun(t, cs)
+
+	m := cs.AggregatedMetrics()
+
+	if m.CompletedRequests != 5 {
+		t.Fatalf("CompletedRequests: got %d, want 5", m.CompletedRequests)
+	}
+	if m.TimedOutRequests != 0 {
+		t.Errorf("TimedOutRequests: got %d, want 0 (orphaned timeouts must not fire)", m.TimedOutRequests)
+	}
+
+	// SimEndedTime must reflect actual completion, not the last orphaned timeout.
+	// Last arrival at 400_000 µs; with beta=[1000,10,5] per-request completion is ~6ms.
+	// Lower bound (> 400_000): last arrival advanced the clock past 400ms.
+	// Upper bound (< 1_000_000): 300× below workload.DefaultTimeoutUs; catches inflation.
+	if m.SimEndedTime <= 400_000 {
+		t.Errorf("SimEndedTime too low: got %d µs, want > 400_000 µs", m.SimEndedTime)
+	}
+	if m.SimEndedTime > 1_000_000 {
+		t.Errorf("SimEndedTime inflated by orphaned timeout in cluster path: got %d µs (%.1fs), want < 1_000_000 µs",
+			m.SimEndedTime, float64(m.SimEndedTime)/1e6)
+	}
+}
+
+// TestClusterSimulator_MixedOrphanedAndGenuineTimeout_CorrectMetrics verifies that
+// the lazy-cancellation guard skips only completed-request (orphaned) TimeoutEvents
+// and does not suppress genuine timeouts for still-queued requests.
+//
+// Scenario (1 instance, batch-size 1):
+//   - r0: arrives at 0, 300s deadline → completes normally (~6ms), orphaned timeout skipped
+//   - r1: arrives at 0, 300s deadline → queued behind r0, completes normally (~12ms), orphaned timeout skipped
+//   - r2: arrives at 0, 5000µs deadline → queued behind r0; r0 takes ~6ms so r2 times out while waiting
+//
+// Expected: CompletedRequests=2, TimedOutRequests=1, SimEndedTime reflects r1's
+// completion time (~12ms), not r0/r1's orphaned 300s timeouts.
+func TestClusterSimulator_MixedOrphanedAndGenuineTimeout_CorrectMetrics(t *testing.T) {
+	config := DeploymentConfig{
+		SimConfig: sim.SimConfig{
+			Horizon:             500_000_000,
+			Seed:                42,
+			KVCacheConfig:       sim.NewKVCacheConfig(10000, 16, 0, 0, 0, 0),
+			BatchConfig:         sim.NewBatchConfig(1, 2048, 0), // max 1 running — forces queuing
+			LatencyCoeffs:       sim.NewLatencyCoeffs([]float64{1000, 10, 5}, []float64{0, 0, 0}),
+			ModelHardwareConfig: sim.NewModelHardwareConfig(sim.ModelConfig{}, sim.HardwareCalib{}, "test", "H100", 1, "blackbox", 0),
+		},
+		NumInstances: 1,
+	}
+
+	// r0 and r1 complete before their 300s deadline (orphaned TimeoutEvents).
+	// r2 has a 5000µs deadline — shorter than the time r0 takes to complete (~6ms),
+	// so r2 times out while queued. This verifies the guard uses State==StateCompleted
+	// (not a broader condition) and does not suppress genuine timeouts.
+	requests := []*sim.Request{
+		{
+			ID: "r0", ArrivalTime: 0,
+			InputTokens: make([]int, 10), OutputTokens: make([]int, 5),
+			State: sim.StateQueued, MaxOutputLen: 5,
+			Deadline: workload.DefaultTimeoutUs,
+		},
+		{
+			ID: "r1", ArrivalTime: 0,
+			InputTokens: make([]int, 10), OutputTokens: make([]int, 5),
+			State: sim.StateQueued, MaxOutputLen: 5,
+			Deadline: workload.DefaultTimeoutUs,
+		},
+		{
+			ID: "r2", ArrivalTime: 0,
+			InputTokens: make([]int, 10), OutputTokens: make([]int, 5),
+			State: sim.StateQueued, MaxOutputLen: 5,
+			Deadline: 5_000, // 5ms — r0 takes ~6ms, so r2 times out while queued
+		},
+	}
+
+	cs := NewClusterSimulator(config, requests, nil)
+	mustRun(t, cs)
+
+	m := cs.AggregatedMetrics()
+
+	if m.CompletedRequests != 2 {
+		t.Errorf("CompletedRequests: got %d, want 2", m.CompletedRequests)
+	}
+	if m.TimedOutRequests != 1 {
+		t.Errorf("TimedOutRequests: got %d, want 1 (r2 must genuinely time out)", m.TimedOutRequests)
+	}
+	// INV-1: 3 injected = 2 completed + 1 timed-out
+	if got := m.CompletedRequests + m.TimedOutRequests; got != 3 {
+		t.Errorf("conservation: CompletedRequests(%d) + TimedOutRequests(%d) = %d, want 3",
+			m.CompletedRequests, m.TimedOutRequests, got)
+	}
+	// r1 completes after r0 (~12ms total); SimEndedTime should reflect r1's
+	// completion, not r0/r1's orphaned 300s timeouts.
+	// Lower bound > 10_000: r0 takes ~6ms and r1 runs after, so SimEndedTime
+	// must exceed 10ms — verifying both requests actually ran, not just r2's timeout.
+	if m.SimEndedTime <= 10_000 {
+		t.Errorf("SimEndedTime too low: got %d µs, want > 10_000 µs (r0+r1 must both complete)", m.SimEndedTime)
+	}
+	if m.SimEndedTime > 100_000 {
+		t.Errorf("SimEndedTime inflated by orphaned timeout: got %d µs (%.1fs), want < 100_000 µs",
+			m.SimEndedTime, float64(m.SimEndedTime)/1e6)
+	}
+}
+
+// TestClusterSimulator_PD_OrphanedTimeout_TimingNotInflated verifies that with
+// PD disaggregation, orphaned TimeoutEvents on the prefill instance do not
+// inflate per-request phase timestamps set by detectPrefillCompletions via
+// c.clock. If c.clock were not restored after a skipped orphaned timeout,
+// KVTransferStartedEvent.time and parent.PrefillCompleteTime could be set to
+// the orphaned timestamp (~300s) rather than the actual prefill completion time.
+//
+// Scenario: 4 requests through a 2P+2D cluster, each with a workload.DefaultTimeoutUs
+// deadline. All complete well before the deadline. Assert that PrefillCompleteTime,
+// TransferStartTime, and the causality chain are bounded by actual work time.
+func TestClusterSimulator_PD_OrphanedTimeout_TimingNotInflated(t *testing.T) {
+	config := newTestDisaggDeploymentConfig(4, 2, 2)
+	config.Horizon = 500_000_000 // 500s — beyond workload.DefaultTimeoutUs
+
+	rng := sim.NewPartitionedRNG(sim.NewSimulationKey(42))
+	workloadRNG := rng.ForSubsystem(sim.SubsystemWorkload)
+
+	const n = 4
+	requests := make([]*sim.Request, n)
+	for i := 0; i < n; i++ {
+		arrivalTime := int64(i * 10_000)
+		requests[i] = &sim.Request{
+			ID:           fmt.Sprintf("pd_r%d", i),
+			ArrivalTime:  arrivalTime,
+			InputTokens:  sim.GenerateRandomTokenIDs(workloadRNG, 10),
+			OutputTokens: sim.GenerateRandomTokenIDs(workloadRNG, 5),
+			State:        sim.StateQueued,
+			MaxOutputLen: 5,
+			Deadline:     arrivalTime + workload.DefaultTimeoutUs,
+		}
+	}
+
+	cs := NewClusterSimulator(config, requests, nil)
+	mustRun(t, cs)
+
+	m := cs.AggregatedMetrics()
+	if m.CompletedRequests != n {
+		t.Fatalf("CompletedRequests: got %d, want %d", m.CompletedRequests, n)
+	}
+	if m.TimedOutRequests != 0 {
+		t.Errorf("TimedOutRequests: got %d, want 0", m.TimedOutRequests)
+	}
+
+	// Phase timestamps set by detectPrefillCompletions/detectDecodeCompletions
+	// use c.clock. If c.clock were not restored after an orphaned timeout skip,
+	// these would be inflated to ~300s. Assert all are bounded well below 1s.
+	const phaseThreshold = int64(1_000_000) // 1s
+	for _, parent := range cs.parentRequests {
+		if parent.PrefillCompleteTime > phaseThreshold {
+			t.Errorf("parent %s: PrefillCompleteTime inflated: %d µs (%.1fs), want < %d µs",
+				parent.ID, parent.PrefillCompleteTime, float64(parent.PrefillCompleteTime)/1e6, phaseThreshold)
+		}
+		if parent.TransferStartTime > phaseThreshold {
+			t.Errorf("parent %s: TransferStartTime inflated: %d µs (%.1fs), want < %d µs",
+				parent.ID, parent.TransferStartTime, float64(parent.TransferStartTime)/1e6, phaseThreshold)
+		}
+		// Causality: each phase must not precede the prior one.
+		chain := []struct {
+			name  string
+			value int64
+		}{
+			{"ArrivalTime", parent.ArrivalTime},
+			{"PrefillCompleteTime", parent.PrefillCompleteTime},
+			{"TransferStartTime", parent.TransferStartTime},
+			{"TransferCompleteTime", parent.TransferCompleteTime},
+			{"DecodeEnqueueTime", parent.DecodeEnqueueTime},
+		}
+		for i := 1; i < len(chain); i++ {
+			if chain[i].value < chain[i-1].value {
+				t.Errorf("parent %s causality: %s (%d) < %s (%d)",
+					parent.ID, chain[i].name, chain[i].value, chain[i-1].name, chain[i-1].value)
+			}
+		}
+	}
+}
+

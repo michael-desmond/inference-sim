@@ -148,7 +148,7 @@ func TestObserveOrchestrator_OpenLoop_ConservationAndConcurrency(t *testing.T) {
 
 	// WHEN dispatching with max-concurrency 2 and 0 warmup
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, nil, requests, false, 2, 0, nil, nil, false, false)
+	runObserveOrchestrator(ctx, client, recorder, nil, requests, false, 2, 0, nil, nil, false, 0, false, 1.0)
 
 	// THEN: BC-6 conservation: all 5 requests recorded
 	records := recorder.Records()
@@ -215,7 +215,7 @@ func TestObserveOrchestrator_SessionFollowUp_GeneratesRound2(t *testing.T) {
 	sessionMgr := workload.NewSessionManager(wl.Sessions)
 
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, false, 10, 0, nil, nil, false, false)
+	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, false, 10, 0, nil, nil, false, 0, false, 1.0)
 
 	records := recorder.Records()
 	if len(records) < 2 {
@@ -282,7 +282,7 @@ func TestObserveOrchestrator_SessionError_CancelsSession(t *testing.T) {
 	sessionMgr := workload.NewSessionManager(wl.Sessions)
 
 	ctx := context.Background()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, false, 10, 0, nil, nil, false, false)
+	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, false, 10, 0, nil, nil, false, 0, false, 1.0)
 
 	records := recorder.Records()
 	for _, r := range records {
@@ -314,7 +314,7 @@ func TestObserveOrchestrator_WarmupExclusion(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 2, nil, nil, false, false)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 2, nil, nil, false, 0, false, 1.0)
 
 	records := recorder.Records()
 	if len(records) != 3 {
@@ -342,7 +342,7 @@ func TestObserveOrchestrator_WarmupExceedsTotal(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 5, nil, nil, false, false)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 5, nil, nil, false, 0, false, 1.0)
 
 	records := recorder.Records()
 	if len(records) != 0 {
@@ -381,7 +381,7 @@ func TestObserveOrchestrator_RecordITL_CapturesChunkTimestamps(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, true)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, 0, true, 1.0)
 
 	// THEN ITL records are captured
 	itlRecords := recorder.ITLRecords()
@@ -422,7 +422,7 @@ func TestObserveOrchestrator_TimestampOrdering(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, false)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, 0, false, 1.0)
 
 	records := recorder.Records()
 	if len(records) != 1 {
@@ -462,7 +462,7 @@ func TestObserveOrchestrator_TraceV2RoundTrip(t *testing.T) {
 
 	client := NewRealClient(server.URL, "", "test-model", "vllm")
 	recorder := &Recorder{}
-	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, false)
+	runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 10, 0, nil, nil, false, 0, false, 1.0)
 
 	headerPath := filepath.Join(t.TempDir(), "header.yaml")
 	dataPath := filepath.Join(t.TempDir(), "data.csv")
@@ -520,7 +520,7 @@ func TestObserveOrchestrator_ErrorStormDrain(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 5, 0, nil, nil, false, false)
+		runObserveOrchestrator(context.Background(), client, recorder, nil, requests, false, 5, 0, nil, nil, false, 0, false, 1.0)
 		close(done)
 	}()
 
@@ -564,7 +564,7 @@ func TestObserveOrchestrator_ContextCancellation(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runObserveOrchestrator(ctx, client, recorder, nil, requests, false, 2, 0, nil, nil, false, false)
+		runObserveOrchestrator(ctx, client, recorder, nil, requests, false, 2, 0, nil, nil, false, 0, false, 1.0)
 		close(done)
 	}()
 
@@ -667,7 +667,7 @@ func TestRequestToPending_PrependsPrefixString(t *testing.T) {
 		PrefixLength: 64,
 	}
 
-	pending := requestToPending(req, 0, false, false, prefixes, prefixLengths)
+	pending := requestToPending(req, 0, false, false, 0, prefixes, prefixLengths, 1.0)
 
 	// PrefixGroup and PrefixLength propagated to PendingRequest
 	if pending.PrefixGroup != "shared" {
@@ -681,21 +681,22 @@ func TestRequestToPending_PrependsPrefixString(t *testing.T) {
 	if !strings.HasPrefix(pending.Prompt, "alpha bravo charlie ") {
 		t.Errorf("prompt should start with prefix, got %q", pending.Prompt[:min(50, len(pending.Prompt))])
 	}
-	// Suffix should have 7 "hello " words (10 total - 3 prefix)
+	// Suffix should have 7 words (10 total - 3 prefix), drawn from vocabulary
 	suffix := strings.TrimPrefix(pending.Prompt, "alpha bravo charlie ")
-	helloCount := strings.Count(suffix, "hello ")
-	if helloCount != 7 {
-		t.Errorf("suffix 'hello' count = %d, want 7 (10 - 3 prefix)", helloCount)
+	suffixWords := strings.Fields(suffix)
+	if len(suffixWords) != 7 {
+		t.Errorf("suffix word count = %d, want 7 (10 - 3 prefix)", len(suffixWords))
 	}
 
 	// Without prefix group: no prefix
 	reqNoPrefix := &sim.Request{
 		ID:          "test2",
-		InputTokens: make([]int, 10),
+		InputTokens: []int{5, 15, 25, 35, 45, 55, 65, 75, 85, 95},
 	}
-	pendingNoPrefix := requestToPending(reqNoPrefix, 1, false, false, prefixes, prefixLengths)
-	if strings.HasPrefix(pendingNoPrefix.Prompt, "alpha") {
-		t.Error("request without prefix group should not have prefix")
+	pendingNoPrefix := requestToPending(reqNoPrefix, 1, false, false, 0, prefixes, prefixLengths, 1.0)
+	// Without prefix group, prompt should not start with the group prefix string
+	if strings.HasPrefix(pendingNoPrefix.Prompt, "alpha bravo charlie ") {
+		t.Error("request without prefix group should not have prefix group's prefix string")
 	}
 }
 
@@ -712,17 +713,17 @@ func TestRequestToPending_UsesPerRequestStreaming(t *testing.T) {
 	}
 
 	// BC-1 / BC-3: without global override, per-request value propagates
-	p1 := requestToPending(streamingReq, 0, false, false, nil, nil)
+	p1 := requestToPending(streamingReq, 0, false, false, 0, nil, nil, 1.0)
 	if !p1.Streaming {
 		t.Error("expected Streaming=true for streaming request when noStreaming=false")
 	}
-	p2 := requestToPending(nonStreamingReq, 1, false, false, nil, nil)
+	p2 := requestToPending(nonStreamingReq, 1, false, false, 0, nil, nil, 1.0)
 	if p2.Streaming {
 		t.Error("expected Streaming=false for non-streaming request when noStreaming=false")
 	}
 
 	// BC-2: --no-streaming overrides per-request value to false
-	p3 := requestToPending(streamingReq, 2, true, false, nil, nil)
+	p3 := requestToPending(streamingReq, 2, true, false, 0, nil, nil, 1.0)
 	if p3.Streaming {
 		t.Error("expected Streaming=false when noStreaming=true overrides req.Streaming=true")
 	}
@@ -850,19 +851,178 @@ func TestRequestToPending_SuffixUsesTokenCountNotWordCount(t *testing.T) {
 		t.Fatalf("prefix word count = %d, want 50", len(prefixWords))
 	}
 
+	suffixTokens := make([]int, 200)
+	for i := range suffixTokens {
+		suffixTokens[i] = i * 3
+	}
 	req := &sim.Request{
 		ID:          "test",
-		InputTokens: make([]int, 200),
+		InputTokens: suffixTokens,
 		PrefixGroup: "scaled",
 	}
-	pending := requestToPending(req, 0, false, false, prefixes, prefixLengths)
+	pending := requestToPending(req, 0, false, false, 0, prefixes, prefixLengths, 1.0)
 
-	// Suffix should be 200 - 100 = 100 "hello " words (using token counts),
-	// NOT 200 - 50 = 150 (which would happen if word count leaked into prefixLengths)
+	// Suffix should have 100 words (200 total tokens - 100 prefix tokens at ratio 1.0),
+	// NOT 150 (which would happen if word count leaked into prefixLengths)
 	suffix := pending.Prompt[len(prefixes["scaled"]):]
-	helloCount := strings.Count(suffix, "hello ")
-	if helloCount != 100 {
-		t.Errorf("suffix hello count = %d, want 100 (200 total tokens - 100 prefix tokens)", helloCount)
+	suffixWords := strings.Fields(suffix)
+	if len(suffixWords) != 100 {
+		t.Errorf("suffix word count = %d, want 100 (200 total tokens - 100 prefix tokens)", len(suffixWords))
+	}
+}
+
+func TestRequestToPending_NoPrefixDiversePrompt(t *testing.T) {
+	// Two requests with different random token IDs and no prefix group
+	req1 := &sim.Request{
+		ID:          "r1",
+		InputTokens: []int{10, 20, 30, 40, 50},
+	}
+	req2 := &sim.Request{
+		ID:          "r2",
+		InputTokens: []int{60, 70, 80, 90, 100},
+	}
+
+	// tokensPerWord=1.0 for direct word-to-token mapping
+	p1 := requestToPending(req1, 0, false, false, 0, nil, nil, 1.0)
+	p2 := requestToPending(req2, 1, false, false, 0, nil, nil, 1.0)
+
+	// BC-2: different token IDs -> different prompts
+	if p1.Prompt == p2.Prompt {
+		t.Error("requests with different token IDs should produce different prompts")
+	}
+
+	// BC-1: prompt should NOT be "hello hello hello..."
+	if strings.Contains(p1.Prompt, "hello") {
+		t.Error("prompt should use vocabulary words, not 'hello'")
+	}
+
+	// Prompt should have 5 words (matching InputTokens length at ratio 1.0)
+	words := strings.Fields(p1.Prompt)
+	if len(words) != 5 {
+		t.Errorf("word count = %d, want 5", len(words))
+	}
+}
+
+func TestRequestToPending_WordCountScaledByTokensPerWord(t *testing.T) {
+	// BC-5: with tokensPerWord=2.0, 100 tokens should produce 50 words
+	tokens := make([]int, 100)
+	for i := range tokens {
+		tokens[i] = i * 7 // deterministic, diverse values
+	}
+	req := &sim.Request{
+		ID:          "scaled",
+		InputTokens: tokens,
+	}
+
+	pending := requestToPending(req, 0, false, false, 0, nil, nil, 2.0)
+	words := strings.Fields(pending.Prompt)
+	if len(words) != 50 {
+		t.Errorf("word count = %d, want 50 (100 tokens / 2.0 tokensPerWord)", len(words))
+	}
+}
+
+func TestRequestToPending_UnknownPrefixGroupFallback(t *testing.T) {
+	// When PrefixGroup is set but not found in prefixes map, the prompt
+	// should fall back to tokensToPrompt (diverse vocabulary), not "hello".
+	prefixes := map[string]string{"groupA": "some prefix "}
+	prefixLengths := map[string]int{"groupA": 5}
+
+	req := &sim.Request{
+		ID:          "fallback",
+		InputTokens: []int{3, 17, 42, 88, 61},
+		PrefixGroup: "unknownGroup",
+	}
+	pending := requestToPending(req, 0, false, false, 0, prefixes, prefixLengths, 1.0)
+
+	if strings.Contains(pending.Prompt, "hello") {
+		t.Error("unknown prefix group fallback should use vocabulary words, not 'hello'")
+	}
+	words := strings.Fields(pending.Prompt)
+	if len(words) != 5 {
+		t.Errorf("word count = %d, want 5", len(words))
+	}
+	// Should NOT start with groupA's prefix
+	if strings.HasPrefix(pending.Prompt, "some prefix") {
+		t.Error("unknown group should not use another group's prefix")
+	}
+}
+
+func TestTokensToPrompt_DiverseWords(t *testing.T) {
+	tokens := []int{0, 1, 50, 99, 100, 200}
+	result := tokensToPrompt(tokens, 6)
+	words := strings.Fields(result)
+
+	if len(words) != 6 {
+		t.Fatalf("word count = %d, want 6", len(words))
+	}
+
+	// Each word must be from prefixVocabulary
+	vocabSet := make(map[string]bool)
+	for _, w := range prefixVocabulary {
+		vocabSet[w] = true
+	}
+	for i, w := range words {
+		if !vocabSet[w] {
+			t.Errorf("word[%d] = %q, not in prefixVocabulary", i, w)
+		}
+	}
+
+	// Words should not all be the same (unlike the old "hello hello hello" bug)
+	uniqueWords := make(map[string]bool)
+	for _, w := range words {
+		uniqueWords[w] = true
+	}
+	if len(uniqueWords) < 2 {
+		t.Errorf("expected diverse words, got %d unique out of %d", len(uniqueWords), len(words))
+	}
+}
+
+func TestTokensToPrompt_EmptyTokens(t *testing.T) {
+	// Edge case: empty token array with wordCount=1 should not panic
+	result := tokensToPrompt(nil, 1)
+	words := strings.Fields(result)
+	if len(words) != 1 {
+		t.Fatalf("word count = %d, want 1", len(words))
+	}
+	// Word must be from vocabulary (fallback path uses i % vocabLen)
+	vocabSet := make(map[string]bool)
+	for _, w := range prefixVocabulary {
+		vocabSet[w] = true
+	}
+	if !vocabSet[words[0]] {
+		t.Errorf("word = %q, not in prefixVocabulary", words[0])
+	}
+}
+
+func TestTokensToPrompt_NegativeTokenIDs(t *testing.T) {
+	// Negative token IDs should not panic (Go % preserves sign).
+	tokens := []int{-1, -100, -50, 7}
+	result := tokensToPrompt(tokens, 4)
+	words := strings.Fields(result)
+	if len(words) != 4 {
+		t.Fatalf("word count = %d, want 4", len(words))
+	}
+	vocabSet := make(map[string]bool)
+	for _, w := range prefixVocabulary {
+		vocabSet[w] = true
+	}
+	for i, w := range words {
+		if !vocabSet[w] {
+			t.Errorf("word[%d] = %q, not in prefixVocabulary", i, w)
+		}
+	}
+}
+
+func TestRequestToPending_WordCountClampedToOne(t *testing.T) {
+	// 1 token with tokensPerWord=2.0 → round(0.5)=0 → clamped to 1
+	req := &sim.Request{
+		ID:          "tiny",
+		InputTokens: []int{42},
+	}
+	pending := requestToPending(req, 0, false, false, 0, nil, nil, 2.0)
+	words := strings.Fields(pending.Prompt)
+	if len(words) != 1 {
+		t.Errorf("word count = %d, want 1 (clamped minimum)", len(words))
 	}
 }
 
@@ -905,6 +1065,61 @@ func TestObserveCmd_UnconstrainedOutputFlag_Exists(t *testing.T) {
 	}
 	if f.DefValue != "false" {
 		t.Errorf("--unconstrained-output default: got %q, want %q", f.DefValue, "false")
+	}
+}
+
+func TestObserveCmd_MinTokensFlag_Exists(t *testing.T) {
+	f := observeCmd.Flags().Lookup("min-tokens")
+	if f == nil {
+		t.Fatal("missing expected flag --min-tokens")
+	}
+	if f.DefValue != "0" {
+		t.Errorf("--min-tokens default: got %q, want %q", f.DefValue, "0")
+	}
+}
+
+func TestRequestToPending_MinTokensPropagated(t *testing.T) {
+	req := &sim.Request{
+		ID:          "min-tok",
+		InputTokens: make([]int, 5),
+	}
+	p := requestToPending(req, 0, false, false, 128, nil, nil, 1.0)
+	if p.MinTokens != 128 {
+		t.Errorf("MinTokens = %d, want 128", p.MinTokens)
+	}
+}
+
+func TestSend_MinTokensInBody(t *testing.T) {
+	var receivedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"text": "ok", "finish_reason": "length"},
+			},
+			"usage": map[string]interface{}{"completion_tokens": 10, "prompt_tokens": 5},
+		})
+	}))
+	defer server.Close()
+
+	client := NewRealClient(server.URL, "", "test-model", "vllm")
+
+	// min_tokens > 0: included in body
+	req := &PendingRequest{Prompt: "hello", MaxOutputTokens: 256, MinTokens: 128}
+	_, _ = client.Send(context.Background(), req)
+	if v, ok := receivedBody["min_tokens"]; !ok {
+		t.Error("min_tokens not found in request body")
+	} else if int(v.(float64)) != 128 {
+		t.Errorf("min_tokens = %v, want 128", v)
+	}
+
+	// min_tokens = 0: omitted from body
+	receivedBody = nil
+	req2 := &PendingRequest{Prompt: "hello", MaxOutputTokens: 256, MinTokens: 0}
+	_, _ = client.Send(context.Background(), req2)
+	if _, ok := receivedBody["min_tokens"]; ok {
+		t.Error("min_tokens should be omitted when 0")
 	}
 }
 
@@ -1297,6 +1512,183 @@ func TestObserveCmd_ITLFlags_Defined(t *testing.T) {
 	}
 	if itlOutputFlag == nil {
 		t.Error("--itl-output flag not defined")
+	}
+}
+
+func TestValidateMinTokensMean(t *testing.T) {
+	tests := []struct {
+		name      string
+		minTokens int
+		outputMean int
+		wantEmpty bool
+	}{
+		{
+			name:       "min_tokens below mean is valid",
+			minTokens:  100,
+			outputMean: 512,
+			wantEmpty:  true,
+		},
+		{
+			name:       "min_tokens equal to mean is valid",
+			minTokens:  128,
+			outputMean: 128,
+			wantEmpty:  true,
+		},
+		{
+			name:       "min_tokens above mean is invalid",
+			minTokens:  200,
+			outputMean: 100,
+			wantEmpty:  false,
+		},
+		{
+			name:       "min_tokens=0 always valid",
+			minTokens:  0,
+			outputMean: 0,
+			wantEmpty:  true,
+		},
+		{
+			name:       "min_tokens=0 with nonzero mean is valid",
+			minTokens:  0,
+			outputMean: 512,
+			wantEmpty:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := validateMinTokensMean(tc.minTokens, tc.outputMean)
+			if tc.wantEmpty && msg != "" {
+				t.Errorf("expected empty message, got %q", msg)
+			}
+			if !tc.wantEmpty && msg == "" {
+				t.Error("expected non-empty error message, got empty string")
+			}
+		})
+	}
+}
+
+func TestClampRequestsToMinTokens(t *testing.T) {
+	tests := []struct {
+		name       string
+		minTokens  int
+		inputLens  []int
+		wantLens   []int
+		wantCount  int
+	}{
+		{
+			name:      "clamps values below min",
+			minTokens: 128,
+			inputLens: []int{64, 128, 256},
+			wantLens:  []int{128, 128, 256},
+			wantCount: 1,
+		},
+		{
+			name:      "zero MaxOutputLen below default 2048 is unchanged",
+			minTokens: 128,
+			inputLens: []int{0, 64},
+			wantLens:  []int{0, 128},
+			wantCount: 1,
+		},
+		{
+			name:      "zero MaxOutputLen exceeding default 2048 is clamped",
+			minTokens: 3000,
+			inputLens: []int{0},
+			wantLens:  []int{3000},
+			wantCount: 1,
+		},
+		{
+			name:      "all values above min unchanged",
+			minTokens: 50,
+			inputLens: []int{100, 200, 300},
+			wantLens:  []int{100, 200, 300},
+			wantCount: 0,
+		},
+		{
+			name:      "minTokens=0 no change",
+			minTokens: 0,
+			inputLens: []int{10, 20, 30},
+			wantLens:  []int{10, 20, 30},
+			wantCount: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reqs := make([]*sim.Request, len(tc.inputLens))
+			for i, l := range tc.inputLens {
+				reqs[i] = &sim.Request{MaxOutputLen: l}
+			}
+			got := clampRequestsToMinTokens(reqs, tc.minTokens)
+			if got != tc.wantCount {
+				t.Errorf("clampRequestsToMinTokens returned %d, want %d", got, tc.wantCount)
+			}
+			for i, r := range reqs {
+				if r.MaxOutputLen != tc.wantLens[i] {
+					t.Errorf("request[%d]: MaxOutputLen = %d, want %d", i, r.MaxOutputLen, tc.wantLens[i])
+				}
+			}
+			// Invariant: no request with a positive MaxOutputLen has MaxOutputLen < minTokens.
+			for i, r := range reqs {
+				if r.MaxOutputLen > 0 && r.MaxOutputLen < tc.minTokens {
+					t.Errorf("invariant violated: request[%d].MaxOutputLen = %d < minTokens = %d",
+						i, r.MaxOutputLen, tc.minTokens)
+				}
+			}
+		})
+	}
+}
+
+// TestSend_UnconstrainedOutput_MaxTokensNeverBelowMinTokens verifies the assumption that
+// clampRequestsToMinTokens is correctly bypassed when --unconstrained-output is set:
+// Send() either omits max_tokens (chat format) or sets it to math.MaxInt32 (completions
+// format), so vLLM never sees max_tokens < min_tokens regardless of MaxOutputLen values.
+func TestSend_UnconstrainedOutput_MaxTokensNeverBelowMinTokens(t *testing.T) {
+	for _, apiFormat := range []string{"completions", "chat"} {
+		t.Run(apiFormat, func(t *testing.T) {
+			var receivedBody map[string]interface{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+				w.Header().Set("Content-Type", "application/json")
+				if apiFormat == "chat" {
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{"message": map[string]string{"content": "ok"}, "finish_reason": "stop"},
+						},
+						"usage": map[string]interface{}{"completion_tokens": 10, "prompt_tokens": 5},
+					})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"choices": []map[string]interface{}{
+							{"text": "ok", "finish_reason": "stop"},
+						},
+						"usage": map[string]interface{}{"completion_tokens": 10, "prompt_tokens": 5},
+					})
+				}
+			}))
+			defer server.Close()
+
+			client := NewRealClient(server.URL, "", "test-model", "vllm", WithAPIFormat(apiFormat))
+			req := &PendingRequest{
+				Prompt:          "hello",
+				MaxOutputTokens: 64, // would be below any reasonable min_tokens
+				MinTokens:       128,
+				Unconstrained:   true,
+			}
+			_, _ = client.Send(context.Background(), req)
+
+			if v, ok := receivedBody["max_tokens"]; ok {
+				// If max_tokens is present, it must never be less than min_tokens.
+				maxTokens := int(v.(float64))
+				if maxTokens < req.MinTokens {
+					t.Errorf("max_tokens=%d < min_tokens=%d in unconstrained mode; vLLM would reject this",
+						maxTokens, req.MinTokens)
+				}
+			}
+			// chat format must omit max_tokens entirely (server uses model default).
+			if apiFormat == "chat" {
+				if _, ok := receivedBody["max_tokens"]; ok {
+					t.Error("max_tokens must be absent for chat format with Unconstrained=true")
+				}
+			}
+		})
 	}
 }
 

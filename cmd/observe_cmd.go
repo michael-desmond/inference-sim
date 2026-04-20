@@ -56,6 +56,7 @@ var (
 	observeDefaultsFilePath    string
 	observeRecordITL           bool
 	observeITLOutput           string
+	observeMinTokens           int
 )
 
 var observeCmd = &cobra.Command{
@@ -78,8 +79,10 @@ API format: Use --api-format=chat for servers that expose /v1/chat/completions
 which uses /v1/completions with a "prompt" field.
 
 Output control: Use --unconstrained-output to let the server decide output length
-(omits max_tokens for chat, sends large value for completions). Default constrains
-output to the workload spec's sampled MaxOutputTokens.
+(omits max_tokens for chat, sends large value for completions). Use --min-tokens N
+to force the server to generate at least N tokens before EOS (set equal to
+--output-tokens with --output-tokens-stdev 0 for exact token counts).
+Default constrains output to the workload spec's sampled MaxOutputTokens.
 
 Network calibration: Use --rtt-ms to record measured network round-trip time
 in the trace header for calibration normalization.
@@ -139,6 +142,7 @@ func init() {
 	observeCmd.Flags().IntVar(&observePrefixTokens, "prefix-tokens", 0, "Shared prefix token count (distribution mode)")
 	observeCmd.Flags().StringVar(&observeAPIFormat, "api-format", "completions", "API format: 'completions' (/v1/completions) or 'chat' (/v1/chat/completions)")
 	observeCmd.Flags().BoolVar(&observeUnconstrainedOutput, "unconstrained-output", false, "Do not set max_tokens (let server decide output length)")
+	observeCmd.Flags().IntVar(&observeMinTokens, "min-tokens", 0, "Set min_tokens in request body (requests server to generate at least N tokens before EOS; 0 = omit field)")
 	observeCmd.Flags().Float64Var(&observeRttMs, "rtt-ms", 0, "Measured network round-trip time in milliseconds (recorded in trace header)")
 
 	// ITL recording (optional, opt-in)
@@ -252,6 +256,16 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	if observeRttMs < 0 || math.IsNaN(observeRttMs) || math.IsInf(observeRttMs, 0) {
 		logrus.Fatalf("--rtt-ms must be a finite value >= 0, got %v", observeRttMs)
 	}
+	if observeMinTokens < 0 {
+		logrus.Fatalf("--min-tokens must be >= 0, got %d", observeMinTokens)
+	}
+	if observeMinTokens > 0 && !observeUnconstrainedOutput &&
+		observeWorkloadSpec == "" && observeWorkload == "" &&
+		cmd.Flags().Changed("output-tokens") {
+		if msg := validateMinTokensMean(observeMinTokens, observeOutputTokens); msg != "" {
+			logrus.Fatalf("%s", msg)
+		}
+	}
 
 	// Generate workload
 	var spec *workload.WorkloadSpec
@@ -333,6 +347,15 @@ func runObserve(cmd *cobra.Command, _ []string) {
 		logrus.Warn("No requests generated — writing empty trace")
 	}
 
+	// Clamp each request's MaxOutputLen to min_tokens so no request reaches the server
+	// with max_tokens < min_tokens (which vLLM rejects with HTTP 400).
+	if observeMinTokens > 0 && !observeUnconstrainedOutput {
+		if n := clampRequestsToMinTokens(wl.Requests, observeMinTokens); n > 0 {
+			logrus.Infof("Clamped max_tokens floor to min_tokens=%d on %d/%d requests (distribution left tail truncated)",
+				observeMinTokens, n, len(wl.Requests))
+		}
+	}
+
 	// Enable streaming on all requests when --record-itl is set (BC-6)
 	// ITL recording requires streaming responses to capture per-chunk timestamps.
 	// The inference-perf format defaults to non-streaming for parity with the real tool,
@@ -354,6 +377,13 @@ func runObserve(cmd *cobra.Command, _ []string) {
 	client := NewRealClient(observeServerURL, observeAPIKey, observeModel, observeServerType, WithAPIFormat(observeAPIFormat))
 	recorder := &Recorder{}
 
+	// Calibrate tokens-per-word ratio for the server's tokenizer (BC-6).
+	// Used for both prefix string building and non-prefix prompt scaling.
+	calibCtx, calibCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer calibCancel()
+	tokensPerWord := calibratePrefixTokenRatio(calibCtx, client)
+	logrus.Infof("Calibrated tokens-per-word ratio: %.3f", tokensPerWord)
+
 	// Build prefix strings for prefix-group clients (BC-5)
 	var prefixes map[string]string
 	var prefixLengths map[string]int
@@ -369,11 +399,8 @@ func runObserve(cmd *cobra.Command, _ []string) {
 			}
 		}
 		if len(groups) > 0 {
-			calibCtx, calibCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer calibCancel()
-			tokensPerWord := calibratePrefixTokenRatio(calibCtx, client)
 			prefixes, prefixLengths = buildPrefixStrings(groups, spec.Seed, tokensPerWord)
-			logrus.Infof("Built prefix strings for %d prefix groups (%.3f tokens/word)", len(groups), tokensPerWord)
+			logrus.Infof("Built prefix strings for %d prefix groups", len(groups))
 		}
 	}
 
@@ -404,7 +431,7 @@ func runObserve(cmd *cobra.Command, _ []string) {
 
 	// Run orchestrator
 	startTime := time.Now()
-	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeRecordITL)
+	runObserveOrchestrator(ctx, client, recorder, sessionMgr, wl.Requests, observeNoStreaming, observeMaxConcur, observeWarmup, prefixes, prefixLengths, observeUnconstrainedOutput, observeMinTokens, observeRecordITL, tokensPerWord)
 	logrus.Infof("Observation wall-clock time: %.3fs", time.Since(startTime).Seconds())
 
 	// Export trace (BC-4)
@@ -479,7 +506,9 @@ func runObserveOrchestrator(
 	prefixes map[string]string,
 	prefixLengths map[string]int,
 	unconstrained bool,
+	minTokens int,
 	recordITL bool,
+	tokensPerWord float64,
 ) {
 	if len(requests) == 0 {
 		return
@@ -535,7 +564,7 @@ func runObserveOrchestrator(
 		defer wg.Done()
 		defer func() { <-semaphore }() // release concurrency slot
 
-		pending := requestToPending(req, idx, noStreaming, unconstrained, prefixes, prefixLengths)
+		pending := requestToPending(req, idx, noStreaming, unconstrained, minTokens, prefixes, prefixLengths, tokensPerWord)
 		record, sendErr := client.Send(ctx, pending)
 		if sendErr != nil {
 			logrus.Warnf("request %d: Send returned error: %v", idx, sendErr)
@@ -695,14 +724,69 @@ func adaptForSessionManager(original *sim.Request, record *RequestRecord) *sim.R
 	return adapted
 }
 
+// validateMinTokensMean returns a non-empty error message when minTokens exceeds
+// outputMean in distribution synthesis mode. Used only in that mode — spec/preset
+// modes don't use --output-tokens as a distribution mean.
+func validateMinTokensMean(minTokens, outputMean int) string {
+	if minTokens > outputMean {
+		return fmt.Sprintf(
+			"--min-tokens (%d) exceeds --output-tokens (%d); min_tokens must be <= the output-token mean",
+			minTokens, outputMean)
+	}
+	return ""
+}
+
+// clampRequestsToMinTokens raises each request's MaxOutputLen to minTokens when the
+// effective max_tokens falls below minTokens. Applies the same defaultMaxOutputTokens
+// fallback as Send() so that zero-valued MaxOutputLen (→ 2048 on the wire) is also
+// clamped when minTokens > 2048. Returns the count of requests modified.
+func clampRequestsToMinTokens(requests []*sim.Request, minTokens int) int {
+	n := 0
+	for _, r := range requests {
+		effectiveMax := r.MaxOutputLen
+		if effectiveMax <= 0 {
+			effectiveMax = defaultMaxOutputTokens
+		}
+		if effectiveMax < minTokens {
+			r.MaxOutputLen = minTokens
+			n++
+		}
+	}
+	return n
+}
+
+// tokensToPrompt converts token IDs into a diverse prompt string using
+// prefixVocabulary. Each token ID selects a vocabulary word via modular
+// indexing, ensuring different token arrays produce different prompts.
+func tokensToPrompt(tokens []int, wordCount int) string {
+	vocabLen := len(prefixVocabulary)
+	var b strings.Builder
+	b.Grow(wordCount * 8) // average word ~7 chars + space
+	for i := 0; i < wordCount; i++ {
+		var idx int
+		if i < len(tokens) {
+			idx = tokens[i]
+		} else {
+			idx = i
+		}
+		b.WriteString(prefixVocabulary[((idx%vocabLen)+vocabLen)%vocabLen])
+		b.WriteByte(' ')
+	}
+	return b.String()
+}
+
 // requestToPending converts a sim.Request to a PendingRequest for HTTP dispatch.
 // prefixes maps prefix-group name to a pre-built prefix string; prefixLengths maps
 // prefix-group name to the target token count for the prefix (not word count;
 // see buildPrefixStrings). Both may be nil if no prefix groups exist.
-func requestToPending(req *sim.Request, reqIndex int, noStreaming, unconstrained bool, prefixes map[string]string, prefixLengths map[string]int) *PendingRequest {
-	// Generate proportional prompt: ~N words for N InputTokens.
-	// Actual token count varies by tokenizer; ServerInputTokens provides ground truth.
-	wordCount := len(req.InputTokens)
+// tokensPerWord is the calibrated ratio from calibratePrefixTokenRatio; it scales
+// word count so the server tokenizes the prompt to approximately len(InputTokens) tokens.
+func requestToPending(req *sim.Request, reqIndex int, noStreaming, unconstrained bool, minTokens int, prefixes map[string]string, prefixLengths map[string]int, tokensPerWord float64) *PendingRequest {
+	// Scale token count to word count using calibrated ratio (BC-3, BC-6).
+	if tokensPerWord <= 0 {
+		tokensPerWord = 1.0
+	}
+	wordCount := int(math.Round(float64(len(req.InputTokens)) / tokensPerWord))
 	if wordCount <= 0 {
 		wordCount = 1
 	}
@@ -711,16 +795,27 @@ func requestToPending(req *sim.Request, reqIndex int, noStreaming, unconstrained
 	if req.PrefixGroup != "" && prefixes != nil {
 		if prefix, ok := prefixes[req.PrefixGroup]; ok {
 			prefixLen := prefixLengths[req.PrefixGroup]
-			suffixWords := wordCount - prefixLen
+			suffixTokens := len(req.InputTokens) - prefixLen
+			if suffixTokens < 1 {
+				suffixTokens = 1
+			}
+			suffixWords := int(math.Round(float64(suffixTokens) / tokensPerWord))
 			if suffixWords < 1 {
 				suffixWords = 1
 			}
-			prompt = prefix + strings.Repeat("hello ", suffixWords)
+			suffixStart := len(req.InputTokens) - suffixTokens
+			if suffixStart < 0 {
+				suffixStart = 0
+			}
+			if suffixStart > len(req.InputTokens) {
+				suffixStart = len(req.InputTokens)
+			}
+			prompt = prefix + tokensToPrompt(req.InputTokens[suffixStart:], suffixWords)
 		} else {
-			prompt = strings.Repeat("hello ", wordCount)
+			prompt = tokensToPrompt(req.InputTokens, wordCount)
 		}
 	} else {
-		prompt = strings.Repeat("hello ", wordCount)
+		prompt = tokensToPrompt(req.InputTokens, wordCount)
 	}
 
 	return &PendingRequest{
@@ -736,6 +831,7 @@ func requestToPending(req *sim.Request, reqIndex int, noStreaming, unconstrained
 		PrefixLength:    req.PrefixLength,
 		Prompt:          prompt,
 		Unconstrained:   unconstrained,
+		MinTokens:       minTokens,
 		DeadlineUs:      req.Deadline,
 	}
 }

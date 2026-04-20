@@ -62,11 +62,9 @@ func (q *ClusterEventQueue) Pop() any {
 // Complexity: O(N) per call where N = number of instances. At current BLIS scale (≤32 instances)
 // this is negligible. A model→instances index could pre-partition if instance counts exceed 100.
 func buildRouterState(cs *ClusterSimulator, req *sim.Request) *sim.RouterState {
-	// Refresh stale cache snapshots if interval has elapsed (issue #919).
-	// No-op when staleCache is nil (oracle mode, BC-7).
-	if cs.staleCache != nil {
-		cs.staleCache.RefreshIfNeeded(cs.clock)
-	}
+	// Refresh stale cache snapshots if interval has elapsed (#919, #1060).
+	// No-op when CacheBlocks.Mode != Periodic (oracle mode).
+	cs.snapshotProvider.RefreshCacheIfNeeded(cs.clock)
 
 	snapshots := make([]sim.RoutingSnapshot, 0, len(cs.instances))
 	for _, inst := range cs.instances {
@@ -105,6 +103,7 @@ func (e *ClusterArrivalEvent) Priority() int     { return 0 }
 
 // Execute schedules an AdmissionDecisionEvent with the configured admission latency.
 func (e *ClusterArrivalEvent) Execute(cs *ClusterSimulator) {
+	cs.pendingArrivals--
 	logrus.Debugf("[cluster] req %s arrived at tick %d", e.request.ID, e.time)
 	heap.Push(&cs.clusterEvents, clusterEventEntry{
 		event: &AdmissionDecisionEvent{
