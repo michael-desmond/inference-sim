@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/inference-sim/inference-sim/sim/internal/testutil"
@@ -133,8 +134,8 @@ func TestSimulator_PostDecodeFixedOverhead_DelegatesToModel(t *testing.T) {
 		name     string
 		overhead int64
 	}{
-		{"zero (blackbox/roofline)", 0},
-		{"positive (trained-roofline)", 1850},
+		{"zero overhead", 0},
+		{"non-zero overhead", 777},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,7 +179,22 @@ func TestSimulator_GoldenDataset(t *testing.T) {
 		t.Fatal("Golden dataset contains no test cases")
 	}
 
-	for _, tc := range dataset.Tests {
+	var (
+		mu      sync.Mutex
+		updates = make(map[int]testutil.GoldenMetrics, len(dataset.Tests))
+	)
+	if *testutil.UpdateGolden {
+		t.Cleanup(func() {
+			for i, m := range updates {
+				m.SimulationDurationS = dataset.Tests[i].Metrics.SimulationDurationS // wall-clock; not regenerated
+				dataset.Tests[i].Metrics = m
+			}
+			testutil.SaveGoldenDataset(t, dataset)
+		})
+	}
+
+	for i, tc := range dataset.Tests {
+		i, tc := i, tc
 		t.Run(tc.Model, func(t *testing.T) {
 			sim := mustNewSimulator(t, SimConfig{
 				Horizon:             math.MaxInt64,
@@ -262,6 +278,33 @@ func TestSimulator_GoldenDataset(t *testing.T) {
 				sortedSchedulingDelays = append(sortedSchedulingDelays, float64(v))
 			}
 			sort.Float64s(sortedSchedulingDelays)
+
+			if *testutil.UpdateGolden {
+				mu.Lock()
+				updates[i] = testutil.GoldenMetrics{
+					CompletedRequests:      sim.Metrics.CompletedRequests,
+					TotalInputTokens:       sim.Metrics.TotalInputTokens,
+					TotalOutputTokens:      sim.Metrics.TotalOutputTokens,
+					VllmEstimatedDurationS: vllmRuntime,
+					ResponsesPerSec:        responsesPerSec,
+					TokensPerSec:           tokensPerSec,
+					E2EMeanMs:              CalculateMean(sortedE2Es),
+					E2EP90Ms:               CalculatePercentile(sortedE2Es, 90),
+					E2EP95Ms:               CalculatePercentile(sortedE2Es, 95),
+					E2EP99Ms:               CalculatePercentile(sortedE2Es, 99),
+					TTFTMeanMs:             CalculateMean(sortedTTFTs),
+					TTFTP90Ms:              CalculatePercentile(sortedTTFTs, 90),
+					TTFTP95Ms:              CalculatePercentile(sortedTTFTs, 95),
+					TTFTP99Ms:              CalculatePercentile(sortedTTFTs, 99),
+					ITLMeanMs:              CalculateMean(sim.Metrics.AllITLs),
+					ITLP90Ms:               CalculatePercentile(sim.Metrics.AllITLs, 90),
+					ITLP95Ms:               CalculatePercentile(sim.Metrics.AllITLs, 95),
+					ITLP99Ms:               CalculatePercentile(sim.Metrics.AllITLs, 99),
+					SchedulingDelayP99Ms:   CalculatePercentile(sortedSchedulingDelays, 99),
+				}
+				mu.Unlock()
+				return
+			}
 
 			const relTol = 1e-9
 
@@ -1595,9 +1638,9 @@ func TestSimulator_RuntimeLengthCap_E2E(t *testing.T) {
 	if sim.Metrics.TotalOutputTokens == 0 {
 		t.Error("TotalOutputTokens = 0, want > 0 (some decode work should have happened)")
 	}
-	// Regression anchor: proactive cap stops at MaxModelLen(100)-1-input(50) = 49 decode tokens
-	if sim.Metrics.TotalOutputTokens != 49 {
-		t.Errorf("TotalOutputTokens = %d, want 49 (regression anchor)", sim.Metrics.TotalOutputTokens)
+	// Regression anchor: proactive cap stops at MaxModelLen(100)-1-input(50) = 49 decode tokens + 1 prefill-generated = 50
+	if sim.Metrics.TotalOutputTokens != 50 {
+		t.Errorf("TotalOutputTokens = %d, want 50 (regression anchor)", sim.Metrics.TotalOutputTokens)
 	}
 	// KV blocks released
 	if sim.KVCache.UsedBlocks() != 0 {
@@ -2034,7 +2077,7 @@ func TestNewSimulator_NonRooflineZeroNumHeads_Succeeds(t *testing.T) {
 // WHEN the request undergoes multi-chunk prefill (4 chunks: 64,64,64,8)
 // THEN the request completes normally (peak ProgressIndex=249 < 500),
 //
-//	LengthCappedRequests==0, TTFT recorded, TotalOutputTokens==49.
+//	LengthCappedRequests==0, TTFT recorded, TotalOutputTokens==50.
 func TestSimulator_ChunkedPrefill_MaxModelLen_NoSpuriousCap(t *testing.T) {
 	cfg := SimConfig{
 		Horizon:             10_000_000,
@@ -2070,10 +2113,10 @@ func TestSimulator_ChunkedPrefill_MaxModelLen_NoSpuriousCap(t *testing.T) {
 		t.Errorf("TTFT not recorded (hasTTFT=%v, ttft=%v); expected positive TTFT after chunked prefill", hasTTFT, ttft)
 	}
 
-	// TotalOutputTokens: decode runs PI 201→249 = 49 tokens.
+	// TotalOutputTokens: prefill-generated token (PI 200→200) + decode PI 201→249 = 1 + 49 = 50.
 	// Normal completion fires at PI == 200 + max(50,1) - 1 = 249.
-	if sim.Metrics.TotalOutputTokens != 49 {
-		t.Errorf("TotalOutputTokens = %d, want 49 (decode PI 201→249)", sim.Metrics.TotalOutputTokens)
+	if sim.Metrics.TotalOutputTokens != 50 {
+		t.Errorf("TotalOutputTokens = %d, want 50 (prefill-generated + decode PI 201→249)", sim.Metrics.TotalOutputTokens)
 	}
 
 	// INV-1 conservation
@@ -2200,9 +2243,9 @@ func TestSimulator_ProactiveCap_EliminatesOvershoot(t *testing.T) {
 	if sim.Metrics.CompletedRequests != 1 {
 		t.Fatalf("CompletedRequests = %d, want 1", sim.Metrics.CompletedRequests)
 	}
-	// Key: 49 tokens (MaxModelLen-1-input = 100-1-50), not 50 (old behavior)
-	if sim.Metrics.TotalOutputTokens != 49 {
-		t.Errorf("TotalOutputTokens = %d, want 49 (proactive cap: 100-1-50=49)", sim.Metrics.TotalOutputTokens)
+	// Key: 50 tokens (49 decode from proactive cap + 1 prefill-generated)
+	if sim.Metrics.TotalOutputTokens != 50 {
+		t.Errorf("TotalOutputTokens = %d, want 50 (proactive cap: 100-1-50=49 decode + 1 prefill-generated)", sim.Metrics.TotalOutputTokens)
 	}
 	// BC-5 fires at shifted boundary (PI >= maxModelLen-1)
 	if sim.Metrics.LengthCappedRequests != 1 {
@@ -2239,9 +2282,9 @@ func TestSimulator_ProactiveCap_MaxModelLen2_ZeroOutput(t *testing.T) {
 	sim.InjectArrival(req)
 	sim.Run()
 
-	// MaxModelLen=2, input=1: proactive cap allows max(0, 2-1-1)=0 decode tokens
-	if sim.Metrics.TotalOutputTokens != 0 {
-		t.Errorf("TotalOutputTokens = %d, want 0 (MaxModelLen=2, input=1)", sim.Metrics.TotalOutputTokens)
+	// MaxModelLen=2, input=1: proactive cap allows 0 decode tokens, but prefill still generates 1 token
+	if sim.Metrics.TotalOutputTokens != 1 {
+		t.Errorf("TotalOutputTokens = %d, want 1 (MaxModelLen=2, input=1: 0 decode + 1 prefill-generated)", sim.Metrics.TotalOutputTokens)
 	}
 	if sim.Metrics.LengthCappedRequests != 1 {
 		t.Errorf("LengthCappedRequests = %d, want 1", sim.Metrics.LengthCappedRequests)
@@ -2596,5 +2639,270 @@ func TestEnqueueDecodeSubRequest_SimClockAhead_StepEventAtSimClock(t *testing.T)
 		t.Errorf("BC-2: StepEvent time = %d, want %d (simClock); "+
 			"using clusterTime (%d) would violate clock monotonicity INV-3",
 			got, simClock, clusterTime)
+	}
+}
+
+// TestSimulator_TotalOutputTokens_NoDoubleCountAfterPreemption verifies that
+// TotalOutputTokens is not inflated when a request is preempted and re-runs.
+//
+// Scenario: 4 KV blocks × 16 tokens/block = 64 total capacity.
+// B (32 input, 5 output) injected first → head of running batch.
+// A (16 input, 5 output) injected second → tail of running batch (eviction candidate).
+//
+// Token slices use distinct non-zero values to prevent prefix-cache sharing
+// between A and B, ensuring separate block allocations.
+//
+// Block layout at peak concurrency (after B's second prefill chunk + A's full prefill + A's first decode):
+//   B: block0(B-input-0..15) + block2(B-input-16..31) = 2 blocks
+//   A: block1(A-input-0..15) + block3(A-decode-0)     = 2 blocks
+//
+// The eviction is triggered by B, not A: when B needs its first decode token (step 3),
+// all 4 blocks are occupied by B (2) + A (2).  A is at the batch tail, so A is evicted,
+// re-queued with ProgressIndex=0, re-prefills, and eventually completes normally.
+//
+// Without the fix: TotalOutputTokens counts A's pre-eviction decode step AND
+// A's full post-eviction run (one extra).
+// With the fix: TotalOutputTokens = 10 (5 per request: OutputLen).
+func TestSimulator_TotalOutputTokens_NoDoubleCountAfterPreemption(t *testing.T) {
+	// beta=[0,1,0]: StepTime = cacheMissTokens (min 1 µs).
+	// Decode steps cost 0 µs → clamped to 1; prefill costs inputTokens µs.
+	cfg := SimConfig{
+		Horizon:             1_000_000_000,
+		Seed:                42,
+		KVCacheConfig:       NewKVCacheConfig(4, 16, 0, 0, 0, 0),
+		BatchConfig:         NewBatchConfig(10, 10_000, 16),
+		LatencyCoeffs:       NewLatencyCoeffs([]float64{0, 1, 0}, []float64{0, 0, 0}),
+		ModelHardwareConfig: NewModelHardwareConfig(ModelConfig{}, HardwareCalib{}, "test", "H100", 1, "blackbox", 0),
+	}
+	s := mustNewSimulator(t, cfg)
+
+	// Distinct non-zero token slices prevent prefix-cache sharing between A and B.
+	bInput := make([]int, 32)
+	for i := range bInput {
+		bInput[i] = i + 1
+	}
+	aInput := make([]int, 16)
+	for i := range aInput {
+		aInput[i] = 1000 + i
+	}
+
+	// B injected first → WaitQ front → running batch head (index 0), never evicted.
+	// A injected second → running batch tail (index 1), eviction candidate.
+	s.InjectArrival(&Request{ID: "B", ArrivalTime: 0, InputTokens: bInput, OutputTokens: make([]int, 5)})
+	s.InjectArrival(&Request{ID: "A", ArrivalTime: 0, InputTokens: aInput, OutputTokens: make([]int, 5)})
+
+	for s.HasPendingEvents() {
+		s.ProcessNextEvent()
+	}
+
+	// Both requests must complete; verify preemption was exercised.
+	if s.Metrics.PreemptionCount == 0 {
+		t.Fatal("precondition violated: expected at least one preemption, got 0 — scenario does not test the bug")
+	}
+
+	// At normal completion: TotalOutputTokens counts all OutputLen tokens per request
+	// (decode-step increments + 1 prefill-generated token each).
+	// Total = 5 (B) + 5 (A) = 10.
+	want := 10
+	got := s.Metrics.TotalOutputTokens
+	if got != want {
+		t.Errorf("TotalOutputTokens = %d, want %d (extra %d indicates double-count after preemption)",
+			got, want, got-want)
+	}
+
+	// INV-1: all requests must be accounted for.
+	total := s.Metrics.CompletedRequests + s.Metrics.StillQueued + s.Metrics.StillRunning +
+		s.Metrics.DroppedUnservable + s.Metrics.TimedOutRequests
+	if total != 2 {
+		t.Errorf("INV-1 violated: accounted = %d, want 2", total)
+	}
+}
+
+// TestSimulator_ITL_NoDuplicateEntriesAfterPreemption verifies that AllITLs contains
+// exactly one entry per decode step across all completed requests — no phantom entries
+// from aborted runs before preemption.
+//
+// GIVEN a 4-block KV cache that forces eviction when two requests run concurrently,
+// WHEN both requests complete after at least one preemption,
+// THEN len(AllITLs) == sum(OutputLen - 1) for each request (8 total for 2×5-output requests).
+func TestSimulator_ITL_NoDuplicateEntriesAfterPreemption(t *testing.T) {
+	cfg := SimConfig{
+		Horizon:             1_000_000_000,
+		Seed:                42,
+		KVCacheConfig:       NewKVCacheConfig(4, 16, 0, 0, 0, 0),
+		BatchConfig:         NewBatchConfig(10, 10_000, 16),
+		LatencyCoeffs:       NewLatencyCoeffs([]float64{0, 1, 0}, []float64{0, 0, 0}),
+		ModelHardwareConfig: NewModelHardwareConfig(ModelConfig{}, HardwareCalib{}, "test", "H100", 1, "blackbox", 0),
+	}
+	s := mustNewSimulator(t, cfg)
+
+	bInput := make([]int, 32)
+	for i := range bInput {
+		bInput[i] = i + 1
+	}
+	aInput := make([]int, 16)
+	for i := range aInput {
+		aInput[i] = 1000 + i
+	}
+
+	bOutput := make([]int, 5)
+	aOutput := make([]int, 5)
+	s.InjectArrival(&Request{ID: "B", ArrivalTime: 0, InputTokens: bInput, OutputTokens: bOutput})
+	s.InjectArrival(&Request{ID: "A", ArrivalTime: 0, InputTokens: aInput, OutputTokens: aOutput})
+
+	for s.HasPendingEvents() {
+		s.ProcessNextEvent()
+	}
+
+	if s.Metrics.PreemptionCount == 0 {
+		t.Fatal("precondition violated: expected at least one preemption, got 0 — scenario does not test the bug")
+	}
+
+	// Each completed request contributes exactly (OutputLen - 1) ITL entries.
+	// Stale ITL entries from aborted runs before preemption would inflate this count.
+	wantITLCount := (len(bOutput) - 1) + (len(aOutput) - 1) // = 4 + 4 = 8
+	gotITLCount := len(s.Metrics.AllITLs)
+	if gotITLCount != wantITLCount {
+		t.Errorf("len(AllITLs) = %d, want %d (extra %d indicates stale ITL entries from preempted run)",
+			gotITLCount, wantITLCount, gotITLCount-wantITLCount)
+	}
+}
+
+// TestSimulator_TTFTSum_NoDoubleCountAfterPreemption verifies that TTFTSum equals
+// the sum of individual RequestTTFTs values — each request's TTFT counted exactly once.
+//
+// GIVEN a 4-block KV cache that forces eviction when two requests run concurrently,
+// WHEN both requests complete after at least one preemption,
+// THEN TTFTSum == sum(RequestTTFTs.values()) with no double-counts from re-prefill.
+func TestSimulator_TTFTSum_NoDoubleCountAfterPreemption(t *testing.T) {
+	cfg := SimConfig{
+		Horizon:             1_000_000_000,
+		Seed:                42,
+		KVCacheConfig:       NewKVCacheConfig(4, 16, 0, 0, 0, 0),
+		BatchConfig:         NewBatchConfig(10, 10_000, 16),
+		LatencyCoeffs:       NewLatencyCoeffs([]float64{0, 1, 0}, []float64{0, 0, 0}),
+		ModelHardwareConfig: NewModelHardwareConfig(ModelConfig{}, HardwareCalib{}, "test", "H100", 1, "blackbox", 0),
+	}
+	s := mustNewSimulator(t, cfg)
+
+	bInput := make([]int, 32)
+	for i := range bInput {
+		bInput[i] = i + 1
+	}
+	aInput := make([]int, 16)
+	for i := range aInput {
+		aInput[i] = 1000 + i
+	}
+
+	s.InjectArrival(&Request{ID: "B", ArrivalTime: 0, InputTokens: bInput, OutputTokens: make([]int, 5)})
+	s.InjectArrival(&Request{ID: "A", ArrivalTime: 0, InputTokens: aInput, OutputTokens: make([]int, 5)})
+
+	for s.HasPendingEvents() {
+		s.ProcessNextEvent()
+	}
+
+	if s.Metrics.PreemptionCount == 0 {
+		t.Fatal("precondition violated: expected at least one preemption, got 0 — scenario does not test the bug")
+	}
+
+	// TTFTSum must equal the sum of per-request TTFTs. Sort keys first (R2: deterministic
+	// float accumulation requires sorted map iteration).
+	ids := make([]string, 0, len(s.Metrics.RequestTTFTs))
+	for id := range s.Metrics.RequestTTFTs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var manualTTFTSum float64
+	for _, id := range ids {
+		manualTTFTSum += s.Metrics.RequestTTFTs[id]
+	}
+	if float64(s.Metrics.TTFTSum) != manualTTFTSum {
+		t.Errorf("TTFTSum = %d, want %.0f (sum of RequestTTFTs); delta %.0f indicates double-count after preemption",
+			s.Metrics.TTFTSum, manualTTFTSum, float64(s.Metrics.TTFTSum)-manualTTFTSum)
+	}
+}
+
+// TestTotalOutputTokens_Conservation verifies that TotalOutputTokens equals the sum of
+// output token lengths across all completed requests. This invariant catches off-by-one
+// errors (like the prefill-generated-token undercount fixed in issue #1097) and double-
+// counting regressions simultaneously.
+func TestTotalOutputTokens_Conservation(t *testing.T) {
+	cfg := newTestSimConfig()
+	cfg.Horizon = 10_000_000
+	sim := mustNewSimulator(t, cfg)
+
+	requests := testGenerateRequests(42, math.MaxInt64, 5.0/1e6, 20,
+		0, 100, 10, 10, 200, 50, 5, 1, 100)
+	injectRequests(sim, requests)
+	sim.Run()
+
+	if sim.Metrics.CompletedRequests == 0 {
+		t.Fatal("precondition violated: no requests completed — conservation check is vacuous")
+	}
+
+	// Compute expected total from completed requests
+	expected := 0
+	for _, req := range requests {
+		if req.State == StateCompleted {
+			expected += len(req.OutputTokens)
+		}
+	}
+
+	if sim.Metrics.TotalOutputTokens != expected {
+		t.Errorf("TotalOutputTokens conservation violated: got %d, want %d (sum of completed request output lengths)",
+			sim.Metrics.TotalOutputTokens, expected)
+	}
+}
+
+// TestTotalOutputTokens_Conservation_WithPreemption verifies TotalOutputTokens conservation
+// when preemption occurs. Preemption resets ProgressIndex to 0, so re-prefill must not
+// double-count the first output token. Uses a tiny KV cache to guarantee preemption.
+func TestTotalOutputTokens_Conservation_WithPreemption(t *testing.T) {
+	cfg := SimConfig{
+		Horizon:             50_000_000,
+		Seed:                42,
+		KVCacheConfig:       NewKVCacheConfig(4, 16, 0, 0, 0, 0), // 4 blocks × 16 = 64 tokens: forces preemption
+		BatchConfig:         NewBatchConfig(256, 2048, 0),
+		LatencyCoeffs:       NewLatencyCoeffs([]float64{1000, 1, 1}, []float64{0, 0, 0}),
+		ModelHardwareConfig: NewModelHardwareConfig(ModelConfig{}, HardwareCalib{}, "test-model", "H100", 1, "blackbox", 0),
+	}
+	sim := mustNewSimulator(t, cfg)
+
+	// Two requests sized to force preemption: A fills cache during prefill, evicting B.
+	reqA := &Request{
+		ID:          "A",
+		InputTokens: GenerateRandomTokenIDs(sim.WorkloadRNG(), 16),
+		OutputTokens: GenerateRandomTokenIDs(sim.WorkloadRNG(), 5),
+		ArrivalTime: 0,
+		State:       StateQueued,
+	}
+	reqB := &Request{
+		ID:          "B",
+		InputTokens: GenerateRandomTokenIDs(sim.WorkloadRNG(), 32),
+		OutputTokens: GenerateRandomTokenIDs(sim.WorkloadRNG(), 5),
+		ArrivalTime: 0,
+		State:       StateQueued,
+	}
+	sim.InjectArrival(reqA)
+	sim.InjectArrival(reqB)
+	sim.Run()
+
+	if sim.Metrics.PreemptionCount == 0 {
+		t.Fatal("precondition violated: no preemption occurred — test is not exercising the double-count path")
+	}
+	if sim.Metrics.CompletedRequests == 0 {
+		t.Fatal("precondition violated: no requests completed — conservation check is vacuous")
+	}
+
+	expected := 0
+	for _, req := range []*Request{reqA, reqB} {
+		if req.State == StateCompleted {
+			expected += len(req.OutputTokens)
+		}
+	}
+
+	if sim.Metrics.TotalOutputTokens != expected {
+		t.Errorf("TotalOutputTokens conservation violated under preemption: got %d, want %d",
+			sim.Metrics.TotalOutputTokens, expected)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/inference-sim/inference-sim/sim"
+	"github.com/inference-sim/inference-sim/sim/internal/testutil"
 	"github.com/inference-sim/inference-sim/sim/latency"
 	"github.com/inference-sim/inference-sim/sim/workload"
 	"gopkg.in/yaml.v3"
@@ -96,7 +97,7 @@ func TestRoofline_GoldenDataset(t *testing.T) {
 		mu      sync.Mutex
 		updates = make(map[int]goldenExpected, len(ds.Experiments))
 	)
-	if *updateGolden {
+	if *testutil.UpdateGolden {
 		t.Cleanup(func() {
 			for i, expected := range updates {
 				ds.Experiments[i].Expected = expected
@@ -239,12 +240,13 @@ func TestRoofline_GoldenDataset(t *testing.T) {
 			}
 
 			// ── Update mode: record computed values, skip assertions ───────
-			if *updateGolden {
+			if *testutil.UpdateGolden {
 				mu.Lock()
 				updates[i] = goldenExpected{
 					CompletedRequests: m.CompletedRequests,
 					TotalInputTokens:  m.TotalInputTokens,
 					TotalOutputTokens: m.TotalOutputTokens,
+					TTFTSumUs:         m.TTFTSum,
 					TTFTMeanMs:        ttftMean,
 					TTFTP90Ms:         ttftP90,
 					TTFTP99Ms:         ttftP99,
@@ -266,6 +268,9 @@ func TestRoofline_GoldenDataset(t *testing.T) {
 			}
 			if m.TotalOutputTokens != exp.Expected.TotalOutputTokens {
 				t.Errorf("total_output_tokens: got %d, want %d", m.TotalOutputTokens, exp.Expected.TotalOutputTokens)
+			}
+			if m.TTFTSum != exp.Expected.TTFTSumUs {
+				t.Errorf("ttft_sum_us: got %d, want %d", m.TTFTSum, exp.Expected.TTFTSumUs)
 			}
 			// relTol=1e-9 catches floating-point rounding from platform
 			// differences while rejecting any behavioral change to the

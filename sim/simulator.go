@@ -298,7 +298,7 @@ func (sim *Simulator) SimHorizon() int64 { return sim.Horizon }
 // PostDecodeFixedOverhead returns the latency model's fixed per-request post-decode
 // overhead in microseconds. Used by the cluster layer to include overhead in
 // parent.CompletionTime when disaggregated decode sub-requests complete.
-// Returns 0 for all backends except trained-roofline (BC-1, issue #846).
+// Returns 0 for all backends except trained-physics (BC-1, issue #846).
 func (sim *Simulator) PostDecodeFixedOverhead() int64 {
 	return sim.latencyModel.PostDecodeFixedOverhead()
 }
@@ -481,7 +481,7 @@ func (sim *Simulator) recordKVUsageMetrics(stepDuration int64) {
 // E2E and RequestCompletionTimes beyond the RequestLeftEvent timestamp by the overhead
 // amount. This is architecturally intentional: real vLLM's post-processing (detokenization,
 // response serialization) is non-blocking but still contributes to client-perceived latency.
-// For trained-roofline, PostDecodeFixedOverhead adds ~1.85ms to E2E; for other backends it's 0.
+// For trained-physics, PostDecodeFixedOverhead adds ~777µs to E2E; for other backends it's 0.
 func (sim *Simulator) recordRequestCompletion(req *Request) {
 	// INV-1 conservation: Always increment CompletedRequests.
 	// For redirected requests: the source instance drained the request from its WaitQ
@@ -489,6 +489,22 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 	// The destination is the sole completion site. Skipping CompletedRequests++ here
 	// would cause the request to vanish from conservation accounting entirely.
 	sim.Metrics.CompletedRequests++
+	sim.Metrics.TTFTSum += req.FirstTokenTime
+
+	// Count output tokens at completion time (not inline per step) to avoid
+	// double-counting under preemption (ProgressIndex reset to 0 on eviction).
+	// PI - InputLen counts decode-step increments (= OutputLen - 1 for normal completion).
+	// Add 1 for the prefill-generated first token (#1097) when decodeTokens falls short
+	// of OutputLen. PD 1-output decode sub-requests are the exception: their PI_final
+	// lands at InputLen+1 (one step past the InputLen threshold), so decodeTokens==OutputLen
+	// already — the guard prevents double-counting in that case.
+	decodeTokens := int(req.ProgressIndex) - len(req.InputTokens)
+	if decodeTokens < len(req.OutputTokens) {
+		decodeTokens++ // prefill-generated first token (vLLM parity)
+	}
+	if decodeTokens > 0 {
+		sim.Metrics.TotalOutputTokens += decodeTokens
+	}
 
 	var itlSum int64
 	for _, v := range req.ITL {
@@ -528,13 +544,15 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 // Step simulates a single vllm step(): batch scheduling, model execution, mirroring, and completion.
 // Phases: (1) schedule batch, (2) execute prefill/decode, (2.5) mirror to CPU, (3) process completions, (4) schedule next step.
 //
-// Orphaned StepEvent guard: when a TimeoutEvent empties the RunningBatch and nils stepEvent,
-// a previously-scheduled StepEvent may still be in the heap. If the INV-8 guard also scheduled
-// a new StepEvent, two StepEvents fire at the same tick. The second finds RunningBatch nil and
-// WaitQ empty (already processed by the first). This guard prevents the phantom double-step.
+// Orphaned StepEvent guard: when a TimeoutEvent empties the RunningBatch it leaves
+// sim.stepEvent pointing to the already-scheduled StepEvent (preventing the cascade
+// described in #1096). If that StepEvent fires and finds nothing to do, clearing
+// sim.stepEvent here prevents future QueuedEvent INV-8 guards from seeing a stale
+// non-nil pointer and skipping their step-scheduling.
 func (sim *Simulator) Step(now int64) {
 	if sim.RunningBatch == nil && sim.WaitQ.Len() == 0 {
-		return // orphaned StepEvent — nothing to process
+		sim.stepEvent = nil
+		return
 	}
 	sim.scheduleBatch(now)
 	currStepAdvance := sim.executeBatchStep(now)
@@ -630,8 +648,11 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 
 	// Subprocess: Model Execution - this could be prefill or decode depending on the request.
 	// similar to vLLM's execute_model()
-	// Note: TotalOutputTokens++ and TTFT metrics are recorded inline (not extracted to helpers)
-	// because they are tightly coupled to the prefill/decode state transitions in this loop.
+	// Note: Per-request TTFT fields (FirstTokenTime, RequestTTFTs) are recorded inline
+	// because they are tightly coupled to the prefill/decode state transitions in this
+	// loop (scalar/map overwrites, safe across preemption). TTFTSum and TotalOutputTokens
+	// are computed at completion time in recordRequestCompletion to avoid double-counting
+	// when a preempted request re-runs from ProgressIndex=0.
 	for _, req := range sim.RunningBatch.Requests {
 		if req.ProgressIndex < util.Len64(req.InputTokens) {
 			req.ProgressIndex = sim.reqNumComputedTokens[req.ID]
@@ -644,14 +665,15 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 			// Also prevents phantom tokens from token budget exhaustion (pre-existing edge case).
 			if req.NumNewTokens > 0 {
 				req.ProgressIndex++
-				sim.Metrics.TotalOutputTokens++
 				req.ITL = append(req.ITL, currStepAdvance+sim.latencyModel.OutputTokenProcessingTime())
 			}
 		}
-		if req.ProgressIndex == util.Len64(req.InputTokens) { // prefill complete, first token is generated
+		// !req.TTFTSet guard: fires exactly once per request lifetime.
+		// On preemption, ProgressIndex resets to 0 (batch_formation.go) but TTFTSet is
+		// preserved, preventing TTFT double-counting on re-prefill.
+		if req.ProgressIndex == util.Len64(req.InputTokens) && !req.TTFTSet {
 			req.TTFTSet = true
 			req.FirstTokenTime = now + currStepAdvance + sim.latencyModel.OutputTokenProcessingTime() - req.ArrivalTime
-			sim.Metrics.TTFTSum += req.FirstTokenTime // in microsec
 			sim.Metrics.RequestTTFTs[req.ID] = float64(req.FirstTokenTime)
 		}
 	}

@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"flag"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -11,17 +10,6 @@ import (
 	"github.com/inference-sim/inference-sim/sim/workload"
 )
 
-// updateGolden, when set via -update-golden, causes the golden dataset tests
-// to write computed simulation output back to their JSON files instead of
-// asserting against the stored values. Use when a workload-generator bug fix
-// or intentional behavioral change makes the stored values stale:
-//
-//	go test ./sim/cluster/ -update-golden
-//
-// Structural invariants (INV-1, INV-5) still run in update mode to verify
-// correctness; only the stored golden value comparisons are skipped.
-var updateGolden = flag.Bool("update-golden", false, "update golden dataset JSON files with current simulation output")
-
 // Shared golden test helpers used by both roofline_golden_test.go and
 // trained_physics_golden_test.go to avoid duplication.
 
@@ -30,6 +18,7 @@ type goldenExpected struct {
 	CompletedRequests int     `json:"completed_requests"`
 	TotalInputTokens  int     `json:"total_input_tokens"`
 	TotalOutputTokens int     `json:"total_output_tokens"`
+	TTFTSumUs         int64   `json:"ttft_sum_us"`
 	TTFTMeanMs        float64 `json:"ttft_mean_ms"`
 	TTFTP90Ms         float64 `json:"ttft_p90_ms"`
 	TTFTP99Ms         float64 `json:"ttft_p99_ms"`
