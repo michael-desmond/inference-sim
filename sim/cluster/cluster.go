@@ -93,6 +93,10 @@ type ClusterSimulator struct {
 	flowControlEnabled bool
 	saturationDetector sim.SaturationDetector
 	gatewayQueue       *GatewayQueue
+
+	// Cancellation support for stopping running simulations
+	cancelCh  chan struct{}
+	cancelled bool
 }
 
 // effectiveAnalyzerConfig applies WVA reference defaults to zero-valued fields.
@@ -220,6 +224,7 @@ func NewClusterSimulator(config DeploymentConfig, requests []*sim.Request, onReq
 		trace:                simTrace,
 		inFlightRequests:     make(map[string]int, config.NumInstances),
 		shedByTier:           make(map[string]int),
+		cancelCh:             make(chan struct{}),
 	}
 
 	// PD disaggregation: set pool membership (topology already validated above)
@@ -528,6 +533,16 @@ func (c *ClusterSimulator) Run() error {
 
 	// 3. Shared-clock event loop (BC-4: cluster events before instance events)
 	for {
+		// Check for cancellation
+		select {
+		case <-c.cancelCh:
+			c.cancelled = true
+			logrus.Infof("[cluster] Cancellation detected in event loop at clock=%d", c.clock)
+			return fmt.Errorf("simulation cancelled at time %d", c.clock)
+		default:
+			// Continue with event processing
+		}
+
 		// Find earliest cluster event time
 		clusterTime := int64(math.MaxInt64)
 		if len(c.clusterEvents) > 0 {
@@ -655,13 +670,6 @@ func (c *ClusterSimulator) Run() error {
 			}
 		}
 
-
-		// Phase 1B-1b: after each event, promote deferred Batch/Background requests
-		// if the cluster has become idle. INV-8: ensures no stall while deferred work waits.
-		if len(c.deferredQueue) > 0 && !c.isBusy() {
-			c.promoteDeferred()
-		}
-
 		// Notify observers if any are registered and their interval has elapsed
 		c.notifyObservers()
 	}
@@ -763,6 +771,20 @@ func (c *ClusterSimulator) Run() error {
 
 	return nil
 }
+// Stop signals the simulation to stop at the next event loop iteration.
+// Safe to call from another goroutine. Returns immediately; the simulation
+// will stop asynchronously when Run() checks the cancellation channel.
+func (c *ClusterSimulator) Stop() {
+	select {
+	case <-c.cancelCh:
+		// Already closed
+		logrus.Info("[cluster] Stop() called but channel already closed")
+	default:
+		close(c.cancelCh)
+		logrus.Infof("[cluster] Stop() called - cancellation signal sent at clock=%d", c.clock)
+	}
+}
+
 
 // nextSeqID returns the next monotonically increasing sequence ID for event ordering.
 func (c *ClusterSimulator) nextSeqID() int64 {
