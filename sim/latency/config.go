@@ -158,6 +158,12 @@ func parseQuantizationConfig(qc map[string]any) float64 {
 		return 1.0
 	}
 
+	// MXFP4 quantization (Microscaling FP4)
+	// MX formats use 4-bit mantissa with shared exponent
+	if strings.EqualFold(quantMethod, "mxfp4") {
+		return 0.5 // 4 bits = 0.5 bytes per parameter
+	}
+
 	// compressed-tensors: extract from config_groups.*.weights.num_bits
 	if strings.EqualFold(quantMethod, "compressed-tensors") {
 		// Keys are sorted for deterministic iteration (INV-6).
@@ -227,13 +233,20 @@ func GetModelConfigFromHF(hf *HFConfig) (*sim.ModelConfig, error) {
 		"nf4":      1,
 	}
 
-	// Safely extract torch_dtype - defaults to 0 bytes if missing or invalid.
+	// Extract torch_dtype - defaults to bfloat16 (2 bytes) if missing.
 	// Some models (e.g. GLM-5) use "dtype" instead of "torch_dtype".
+	// bfloat16 is the industry standard for modern LLM inference.
 	var bytesPerParam int
 	if dtype, ok := hf.Raw["torch_dtype"].(string); ok {
 		bytesPerParam = precisionToBytesPerParam[dtype]
 	} else if dtype, ok := hf.Raw["dtype"].(string); ok {
 		bytesPerParam = precisionToBytesPerParam[dtype]
+	}
+	
+	// Default to bfloat16 if torch_dtype is missing or invalid
+	if bytesPerParam == 0 {
+		bytesPerParam = 2 // bfloat16
+		logrus.Debugf("torch_dtype not specified; defaulting to bfloat16 (2 bytes) for activations/KV cache")
 	}
 
 	// Intermediate dim: Falcon/GLM use "ffn_hidden_size" instead of "intermediate_size".
