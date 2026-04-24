@@ -769,6 +769,16 @@ func (c *ClusterSimulator) Run() error {
 		}
 	}
 
+	// Notify observers one final time after all simulation processing is complete
+	// This ensures observers receive the final state even if the simulation
+	// was too short for periodic notifications to fire during the main loop
+	if len(c.observers) > 0 {
+		state := c.buildObservationState()
+		for i := range c.observers {
+			c.observers[i].Observer.Observe(state)
+		}
+	}
+
 	return nil
 }
 // Stop signals the simulation to stop at the next event loop iteration.
